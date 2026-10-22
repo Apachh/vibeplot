@@ -13,6 +13,9 @@ Install:   pip install pyside6 pyqtgraph pyelftools numpy
 Run:       python swd_liveplot.py [firmware.elf]
 """
 import csv
+import errno
+import json
+import os
 import queue
 import socket
 import struct
@@ -347,6 +350,7 @@ class Poller(QtCore.QThread):
         self.sock = None
         self.writes = queue.Queue()
         self.wake = threading.Event()
+        self.wall0 = None
 
     def request_write(self, name, addr, raw):
         """Queue a memory write; it is executed by the polling thread between reads."""
@@ -419,6 +423,7 @@ class Poller(QtCore.QThread):
             return
         self.status.emit(f"Connected to OpenOCD at {self.host}:{self.port}")
         t0 = time.perf_counter()
+        self.wall0 = time.time()
         try:
             while not self._stop:
                 t_start = time.perf_counter()
@@ -541,6 +546,178 @@ def build_write_cmd(addr, raw):
     return "; ".join(f"{cmd} 0x{addr + i * w:x} 0x{word:x}" for i, word in enumerate(words))
 
 
+# --------------------------------------------------------------------------
+# Live streaming of the plotted data (virtual COM port / serial port / file)
+# --------------------------------------------------------------------------
+def num_text(fmt_char, v, scaled):
+    if scaled:
+        return f"{v:.12g}"
+    if fmt_char == "f":
+        return f"{v:.9g}"
+    if fmt_char == "d":
+        return f"{v:.17g}"
+    return str(int(v))
+
+
+def tp_name(n):
+    return n.replace("::", ".").replace(":", "_").replace(" ", "_")
+
+
+def csv_field(n):
+    return '"' + n.replace('"', '""') + '"' if any(c in n for c in ',"\n') else n
+
+
+def format_sample(kind, items, ts, ts_kind, new_header):
+    """kind 0 = CSV, 1 = Teleplot, 2 = JSON lines.
+    items = [(name, text, number)]; ts = seconds or None; ts_kind 0 = since Connect, 1 = unix."""
+    if kind == 0:
+        out = ""
+        if new_header:
+            head = [] if ts is None else ["time_s" if ts_kind == 0 else "unix_time_s"]
+            out = ",".join(head + [csv_field(n) for n, _, _ in items]) + "\n"
+        row = ([] if ts is None else [f"{ts:.6f}"]) + [txt for _, txt, _ in items]
+        return out + ",".join(row) + "\n"
+    if kind == 1:
+        lines = []
+        for n, txt, _ in items:
+            nm = tp_name(n)
+            lines.append(f">{nm}:{int(ts * 1000)}:{txt}\n" if ts is not None else f">{nm}:{txt}\n")
+        return "".join(lines)
+    obj = {}
+    if ts is not None:
+        obj["t" if ts_kind == 0 else "unix"] = round(ts, 6)
+    obj["values"] = {n: num for n, _, num in items}
+    return json.dumps(obj, separators=(",", ":")) + "\n"
+
+
+class StreamSink:
+    """Writes text to a file, a serial port or a self-created virtual COM port (pty).
+    A background thread does the writing, so a slow or absent reader never blocks the GUI."""
+    TARGET_VCOM, TARGET_SERIAL, TARGET_FILE = 0, 1, 2
+
+    def __init__(self, target, path, baud=115200, append=False):
+        self.target, self.path, self.baud, self.append = target, path, baud, append
+        self.q = queue.Queue(maxsize=5000)
+        self.written = 0
+        self.dropped = 0
+        self.error = None
+        self.dev = None
+        self.thread = None
+        self._closing = False
+        self._f = self._ser = self._fd = self._master = self._slave = None
+        self._link = False
+
+    def open(self):
+        if self.target == self.TARGET_FILE:
+            self._f = open(self.path, "ab" if self.append else "wb")
+        elif self.target == self.TARGET_VCOM:
+            try:
+                import pty
+                import tty
+            except ImportError:
+                raise OSError("Creating a virtual COM port works on Linux/macOS only. On Windows create a "
+                              "pair with com0com and use 'Existing serial port' with one end of it.")
+            if os.path.lexists(self.path):
+                if not os.path.islink(self.path):
+                    raise OSError(f"{self.path} exists and is not a symlink")
+                os.unlink(self.path)
+            self._master, self._slave = pty.openpty()
+            tty.setraw(self._slave)               # no echo / newline translation
+            os.set_blocking(self._master, False)  # never block when nobody reads
+            self.dev = os.ttyname(self._slave)
+            os.symlink(self.dev, self.path)
+            self._link = True
+        else:
+            try:
+                import serial
+            except ImportError:
+                serial = None
+            if serial is not None:
+                self._ser = serial.Serial(self.path, self.baud, write_timeout=1)
+            else:  # works for Linux ptys/ttys; install pyserial for real COM ports
+                self._fd = os.open(self.path, os.O_WRONLY | os.O_NOCTTY)
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def push(self, text):
+        try:
+            self.q.put_nowait(text.encode())
+        except queue.Full:
+            self.dropped += 1
+
+    def _write(self, data):
+        if self._f is not None:
+            self._f.write(data)
+            self._f.flush()
+        elif self._master is not None:
+            view = memoryview(data)
+            while len(view):
+                try:
+                    n = os.write(self._master, view)
+                except BlockingIOError:   # reader not keeping up: drop the rest of this chunk
+                    self.dropped += 1
+                    return
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        return
+                    raise
+                view = view[n:]
+        elif self._ser is not None:
+            self._ser.write(data)
+        else:
+            os.write(self._fd, data)
+
+    def _run(self):
+        while True:
+            try:
+                data = self.q.get(timeout=0.2)
+            except queue.Empty:
+                if self._closing:
+                    break
+                continue
+            if data is None:
+                break
+            try:
+                self._write(data)
+                self.written += len(data)
+            except Exception as e:
+                self.error = str(e)
+                break
+
+    def describe(self):
+        where = f"{self.path} → {self.dev}" if self.dev else self.path
+        return f"● {where} — {self.written} bytes sent, {self.dropped} dropped"
+
+    def close(self):
+        if self.thread is not None:
+            try:
+                self.q.put(None, timeout=0.5)
+            except queue.Full:
+                pass
+            self.thread.join(2.0)
+            self._closing = True
+        for obj in (self._f, self._ser):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
+        for fd in (self._fd, self._master, self._slave):
+            try:
+                if fd is not None:
+                    os.close(fd)
+            except OSError:
+                pass
+        if self._link:
+            try:
+                if os.path.islink(self.path) and os.readlink(self.path) == self.dev:
+                    os.unlink(self.path)
+            except OSError:
+                pass
+
+
 class Series:
     def __init__(self, sid, name, addr, size, fmt, color):
         self.id, self.name, self.addr, self.size, self.fmt, self.color = sid, name, addr, size, fmt, color
@@ -566,6 +743,115 @@ class Series:
         return f"{name} ({iv})" if name else f"{iv}"
 
 
+class StreamDialog(QtWidgets.QDialog):
+    TARGETS = ["Virtual COM port (created by this app, Linux/macOS)",
+               "Existing serial port / COM port (e.g. one end of a com0com pair)",
+               "File"]
+    DEFAULT_PATHS = ["/tmp/swdplot_com", "", "swd_stream.csv"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        W = QtWidgets
+        self.main = main
+        self.setWindowTitle("Stream plotted data")
+        self.setMinimumWidth(580)
+        self.cmb_target = W.QComboBox()
+        self.cmb_target.addItems(self.TARGETS)
+        self.edit_path = W.QLineEdit(self.DEFAULT_PATHS[0])
+        self.btn_browse = W.QPushButton("Browse…")
+        self.btn_browse.clicked.connect(self.browse)
+        prow = W.QHBoxLayout()
+        prow.addWidget(self.edit_path, 1)
+        prow.addWidget(self.btn_browse)
+        self.spin_baud = W.QSpinBox()
+        self.spin_baud.setRange(300, 4000000)
+        self.spin_baud.setValue(115200)
+        self.chk_append = W.QCheckBox("Append if the file already exists")
+        self.cmb_format = W.QComboBox()
+        self.cmb_format.addItems(["CSV (one row per sample)", "Teleplot (>name:value lines)",
+                                  "JSON lines"])
+        self.cmb_values = W.QComboBox()
+        self.cmb_values.addItems(["Raw memory values", "Raw × gain + offset (as set in the table)"])
+        self.cmb_ts = W.QComboBox()
+        self.cmb_ts.addItems(["Seconds since Connect", "Unix time (UTC seconds)", "No timestamp"])
+        self.spin_every = W.QSpinBox()
+        self.spin_every.setRange(1, 100000)
+        self.spin_every.setPrefix("every ")
+        self.spin_every.setSuffix(" sample(s)")
+        form = W.QFormLayout()
+        form.addRow("Output", self.cmb_target)
+        form.addRow("Path / port", prow)
+        form.addRow("Baud rate", self.spin_baud)
+        form.addRow("", self.chk_append)
+        form.addRow("Format", self.cmb_format)
+        form.addRow("Values", self.cmb_values)
+        form.addRow("Timestamp", self.cmb_ts)
+        form.addRow("Send", self.spin_every)
+        self.lbl_status = W.QLabel("Not streaming")
+        self.lbl_status.setWordWrap(True)
+        self.btn_go = W.QPushButton("Start streaming")
+        self.btn_go.clicked.connect(self.toggle)
+        lay = W.QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(self.lbl_status)
+        lay.addWidget(self.btn_go)
+        self.cmb_target.currentIndexChanged.connect(self.on_target)
+        self.on_target(0)
+
+    def on_target(self, i):
+        if self.edit_path.text().strip() in self.DEFAULT_PATHS:
+            self.edit_path.setText(self.DEFAULT_PATHS[i])
+        self.edit_path.setPlaceholderText("/dev/ttyUSB0, /dev/pts/5 or COM10" if i == 1 else "")
+        self.spin_baud.setEnabled(i == 1)
+        self.btn_browse.setEnabled(i == 2)
+        self.chk_append.setEnabled(i == 2)
+
+    def browse(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Stream to file", self.edit_path.text(),
+                                                        "All files (*)")
+        if path:
+            self.edit_path.setText(path)
+
+    def toggle(self):
+        W = QtWidgets
+        if self.main.sink is not None:
+            self.main.stop_stream()
+            self.update_status()
+            return
+        path = self.edit_path.text().strip()
+        if not path:
+            W.QMessageBox.warning(self, "Stream", "Enter a path or port name.")
+            return
+        target = self.cmb_target.currentIndex()
+        append = self.chk_append.isChecked()
+        if target == 2 and not append and os.path.exists(path) and os.path.getsize(path) > 0:
+            ans = W.QMessageBox.question(self, "Overwrite file?", f"{path} already has data. Overwrite it?")
+            if ans != W.QMessageBox.StandardButton.Yes:
+                return
+        cfg = {"target": target, "path": path, "baud": self.spin_baud.value(), "append": append,
+               "format": self.cmb_format.currentIndex(), "scaled": self.cmb_values.currentIndex() == 1,
+               "ts": self.cmb_ts.currentIndex(), "every": self.spin_every.value()}
+        err = self.main.start_stream(cfg)
+        if err:
+            W.QMessageBox.warning(self, "Cannot start streaming", err)
+        self.update_status()
+
+    def update_status(self):
+        sink = self.main.sink
+        self.btn_go.setText("Stop streaming" if sink else "Start streaming")
+        for w in (self.cmb_target, self.edit_path, self.cmb_format, self.cmb_values, self.cmb_ts,
+                  self.spin_every):
+            w.setEnabled(sink is None)
+        if sink is None:
+            self.on_target(self.cmb_target.currentIndex())
+            self.lbl_status.setText(self.main.stream_msg or "Not streaming")
+        else:
+            for w in (self.spin_baud, self.btn_browse, self.chk_append):
+                w.setEnabled(False)
+            hint = "\nOpen this path in the other program (any baud rate)." if sink.dev else ""
+            self.lbl_status.setText(sink.describe() + hint)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -578,6 +864,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t_last = 0.0
         self.follow = True
         self._enum_ticks = None
+        self.stream_dlg = None
+        self.sink = None
+        self.stream_cfg = None
+        self.stream_msg = ""
+        self._stream_cols = None
+        self._stream_n = 0
         self.period = 0.01
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -626,6 +918,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear.clicked.connect(self.clear_data)
         self.btn_csv = W.QPushButton("Export CSV…")
         self.btn_csv.clicked.connect(self.export_csv)
+        self.btn_stream = W.QPushButton("Stream…")
+        self.btn_stream.setToolTip("Send the plotted values live to a virtual COM port, serial port or file")
+        self.btn_stream.clicked.connect(self.show_stream)
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_elf, 1)
         for lbl, w in (("OpenOCD Tcl host", self.edit_host), ("port", self.spin_port)):
@@ -642,6 +937,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.btn_cursors)
         top.addWidget(self.btn_clear)
         top.addWidget(self.btn_csv)
+        top.addWidget(self.btn_stream)
 
         # left: variable tree
         left = W.QWidget()
@@ -941,6 +1237,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.t.append(t)
                 s.y.append(v)
                 s.last = v
+        self.stream_sample(t, values)
 
     # ---- display
     @staticmethod
@@ -1012,6 +1309,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._set_cell(i, 7, v2)
                     self._set_cell(i, 8, v2 - v1 if v1 is not None and v2 is not None else None)
         self._update_enum_axis()
+        self._update_stream_ui()
         if cur:
             dt = x2 - x1
             freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
@@ -1058,6 +1356,72 @@ class MainWindow(QtWidgets.QMainWindow):
     def remove_all_series(self):
         for s in list(self.series):
             self.remove_series(s)
+
+    # ---- streaming
+    def show_stream(self):
+        if self.stream_dlg is None:
+            self.stream_dlg = StreamDialog(self)
+        self.stream_dlg.update_status()
+        self.stream_dlg.show()
+        self.stream_dlg.raise_()
+        self.stream_dlg.activateWindow()
+
+    def start_stream(self, cfg):
+        sink = StreamSink(cfg["target"], cfg["path"], cfg["baud"], cfg["append"])
+        try:
+            sink.open()
+        except Exception as e:
+            self.stream_msg = f"Cannot start: {e}"
+            return str(e)
+        sink.start()
+        self.sink, self.stream_cfg = sink, cfg
+        self._stream_cols, self._stream_n, self.stream_msg = None, 0, ""
+        self.statusBar().showMessage(f"Streaming to {cfg['path']}")
+        return None
+
+    def stop_stream(self):
+        sink, self.sink = self.sink, None
+        if sink is not None:
+            sink.close()
+            self.stream_msg = f"Stopped ({sink.written} bytes sent, {sink.dropped} dropped)"
+
+    def stream_sample(self, t, values):
+        sink, cfg = self.sink, self.stream_cfg
+        if sink is None:
+            return
+        self._stream_n += 1
+        if cfg["every"] > 1 and (self._stream_n - 1) % cfg["every"]:
+            return
+        cols = [s for s in self.series if s.id in values]
+        if not cols:
+            return
+        scaled = cfg["scaled"]
+        items = []
+        for s in cols:
+            v = values[s.id]
+            num = v * s.gain + s.offset if scaled else v
+            items.append((s.name, num_text(s.fmt, num, scaled), num))
+        ts_kind = 0 if cfg["ts"] == 0 else 1
+        ts = None
+        if cfg["ts"] == 0:
+            ts = t
+        elif cfg["ts"] == 1:
+            wall0 = self.poller.wall0 if self.poller is not None and self.poller.wall0 else time.time() - t
+            ts = wall0 + t
+        ids = tuple(s.id for s in cols)
+        new_header = ids != self._stream_cols
+        self._stream_cols = ids
+        sink.push(format_sample(cfg["format"], items, ts, ts_kind, new_header))
+
+    def _update_stream_ui(self):
+        if self.sink is not None and self.sink.error:
+            err = self.sink.error
+            self.stop_stream()
+            self.stream_msg = f"Stopped: {err}"
+            self.statusBar().showMessage(f"Streaming stopped: {err}")
+        self.btn_stream.setText("Stream ●" if self.sink is not None else "Stream…")
+        if self.stream_dlg is not None and self.stream_dlg.isVisible():
+            self.stream_dlg.update_status()
 
     # ---- writing values
     def edit_value(self, row=None):
@@ -1195,6 +1559,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Saved {path}")
 
     def closeEvent(self, ev):
+        self.stop_stream()
         if self.poller is not None:
             self.poller.stop()
             self.poller.wait(3000)

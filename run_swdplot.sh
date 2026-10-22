@@ -23,10 +23,10 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 
 # Install dependencies only when something is missing
-if ! "$VENV/bin/python" -c "import PySide6, pyqtgraph, elftools, numpy" 2>/dev/null; then
+if ! "$VENV/bin/python" -c "import PySide6, pyqtgraph, elftools, numpy, serial" 2>/dev/null; then
     echo "Installing dependencies ..."
     "$VENV/bin/pip" install --upgrade pip
-    "$VENV/bin/pip" install pyside6 pyqtgraph pyelftools numpy
+    "$VENV/bin/pip" install pyside6 pyqtgraph pyelftools numpy pyserial
 fi
 
 exec "$VENV/bin/python" "$APP" "$@"
