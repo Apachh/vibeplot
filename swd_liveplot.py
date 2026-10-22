@@ -1164,19 +1164,40 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
         combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
         self.table.setCellWidget(r, 3, combo)
-        off = W.QDoubleSpinBox()
-        off.setRange(-1e9, 1e9)
-        off.setDecimals(6)
-        off.setStepType(W.QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
-        off.setValue(s.offset)
-        off.valueChanged.connect(lambda v, s=s: setattr(s, "offset", v))
-        self.table.setCellWidget(r, 4, off)
+        self.table.setCellWidget(r, 4, self._make_offset_widget(s))
         self.table.setItem(r, 5, W.QTableWidgetItem("–"))
         for col in (6, 7, 8):
             self.table.setItem(r, col, W.QTableWidgetItem(""))
         btn = W.QPushButton("✕")
         btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
         self.table.setCellWidget(r, 9, btn)
+
+    def _make_offset_widget(self, s):
+        """Offset editor that matches the variable's type: integer spin box for integer
+        variables, decimal spin box (with the type's precision) for floats."""
+        W = QtWidgets
+        step = W.QAbstractSpinBox.StepType.AdaptiveDecimalStepType
+        if s.fmt in ("f", "d"):
+            w = W.QDoubleSpinBox()
+            w.setDecimals(6 if s.fmt == "f" else 9)
+            w.setRange(-1e15, 1e15)
+            w.setStepType(step)
+            w.setValue(s.offset)
+        elif s.size <= 4:
+            lim = min((1 << (8 * s.size)) - 1, 2 ** 31 - 1)   # QSpinBox is a 32-bit control
+            w = W.QSpinBox()
+            w.setRange(-lim, lim)
+            w.setStepType(step)
+            w.setValue(int(round(s.offset)))
+        else:                                                  # 64-bit integers
+            w = W.QDoubleSpinBox()
+            w.setDecimals(0)
+            w.setRange(-2.0 ** 53, 2.0 ** 53)                  # exact integer range of a double
+            w.setStepType(step)
+            w.setValue(round(s.offset))
+        s.offset = w.value()                                   # keep the clamped / rounded value
+        w.valueChanged.connect(lambda v, s=s: setattr(s, "offset", v))
+        return w
 
     def set_active(self, s, on):
         with self.lock:
@@ -1189,6 +1210,8 @@ class MainWindow(QtWidgets.QMainWindow):
             s.size, s.fmt = size, fmt
         s.t.clear()
         s.y.clear()
+        if s in self.series:
+            self.table.setCellWidget(self.series.index(s), 4, self._make_offset_widget(s))
 
     def remove_series(self, s):
         if s not in self.series:
@@ -1530,7 +1553,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.mode, s.param, s.gain = "None", 10.0, 1.0
             sp = self.table.cellWidget(self.series.index(s), 4)
             if sp is not None:
-                sp.setValue(0.0)
+                sp.setValue(0)
         self.on_selection()
 
     def clear_data(self):
