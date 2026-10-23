@@ -18,7 +18,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 ## Features
 
 - Load an `.elf` and browse its global and `static` variables, including C++ ones (namespaces, class static members, base classes).
-- Structs, unions and arrays expand in the tree; double-click one to add all of its members.
+- Structs, unions, arrays, C++ base classes and bitfields expand in the tree, including **packed structs** (unaligned members are read safely, byte by byte). The tree shows each member's address, byte offset and bit range. Double-click a struct to add all of its members.
 - Live graph with a rolling time window, **Follow live**, **Fit** (both axes) and **Fit Y** (vertical only).
 - Two measurement cursors with values at each cursor, Δ between them, Δt and frequency.
 - Post-processing per variable: moving average, moving RMS, median, low-pass (EMA), derivative, integral, absolute value, remove mean, plus gain and offset.
@@ -31,7 +31,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 
 ## Requirements
 
-- Python 3.9 or newer (recommended).
+- Python 3.9 or newer (recommended). On a fresh Debian/Ubuntu/Mint install: `sudo apt install python3 python3-venv python3-pip libxcb-cursor0` (the last package is needed by Qt's window plugin).
 - A target debugged with **Cortex-Debug using the OpenOCD server** (OpenOCD **0.10 or newer**, because the tool uses its `read_memory` Tcl command).
 - A firmware ELF built **with debug info** (`-g`). Without it only raw symbols are listed.
 - Python packages: `pyside6`, `pyqtgraph`, `pyelftools`, `numpy`, and `pyserial` (needed only for real serial/COM ports).
@@ -137,7 +137,7 @@ Turn on **Cursors** and drag the yellow (C1) and blue (C2) lines. The plot title
 
 Double-click a variable's **Value** cell, or select it and press **Write value…**. Enter a decimal or hex number (`1234`, `0x1F`, `-5`, `1.5`), or pick an enum name. The value is checked against the variable's type and written to memory raw, ignoring gain and offset. It is sent through the same OpenOCD connection as the reads, using OpenOCD's `mww`, `mwh` and `mwb` commands.
 
-Be careful: this writes straight into the running target. If your firmware updates the variable every cycle, it will overwrite your value again. Bitfields are not supported.
+Be careful: this writes straight into the running target. If your firmware updates the variable every cycle, it will overwrite your value again. **Bitfields are read-only**, because writing one would need a read-modify-write that can race with the firmware.
 
 ### Enums
 
@@ -178,6 +178,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 - **Plotting does not halt the CPU**, but the graph freezes at a breakpoint because the values stop changing.
 - Compiler/DWARF notes: GCC (`arm-none-eabi-gcc`) output works. With clang and DWARF 5, addresses may be stored in a form the tool does not read yet; add `-gdwarf-4` if variables are missing.
 - Little-endian targets only, 32-bit addresses.
+- C++ **virtual base classes** (offset only known at run time) and members reached through pointers or references are not shown. Static data members are listed as separate variables.
 - If the window does not open on Wayland or X11, try setting `QT_QPA_PLATFORM=wayland` or `xcb` before starting.
 
 ## Troubleshooting
@@ -186,6 +187,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 |---|---|
 | "Cannot connect" | Wrong port (use the Tcl port), OpenOCD not running, or the debug session ended |
 | Read error with an OpenOCD message | OpenOCD older than 0.10, or the address is not readable memory |
+| Struct or class fields missing | Rebuild with `-g` (and a recent GCC); bitfields, base classes and anonymous unions are supported, virtual bases are not |
 | Variable missing from the list | Built without `-g`, optimized away, local variable, or clang DWARF 5 (see above) |
 | Values look wrong | Change the variable's **Type** in the table (size and signedness) |
 | Streaming to a COM port shows nothing | Reader must open the same path; on Windows use a com0com pair and the "Existing serial port" output |

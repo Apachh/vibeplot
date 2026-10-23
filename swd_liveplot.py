@@ -93,7 +93,7 @@ def array_dims(d):
 
 
 def sizeof(die):
-    d = strip(die)
+    d = complete(strip(die))
     if d is None:
         return 0
     bs = attr(d, "DW_AT_byte_size")
@@ -192,14 +192,63 @@ def qualified(name, decl):
     return "::".join(reversed(parts))
 
 
+TYPE_INDEX = {}   # (tag, name) -> complete struct/union/class DIE (for forward declarations)
+
+
+def complete(d):
+    """Full definition of a struct/class that the current unit only declares."""
+    if d is not None and d.tag in STRUCT_TAGS and "DW_AT_declaration" in d.attributes:
+        return TYPE_INDEX.get((d.tag, die_name(d)), d)
+    return d
+
+
+def member_offset(m, default=0):
+    """Byte offset of a member/base class. Handles plain numbers and DW_OP_plus_uconst
+    expressions; returns None for offsets that are only known at run time (virtual bases)."""
+    v = attr(m, "DW_AT_data_member_location")
+    if v is None:
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, (list, tuple)) and len(v) >= 2 and v[0] == 0x23:   # DW_OP_plus_uconst
+        off = shift = 0
+        for b in v[1:]:
+            off |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                break
+        return off
+    return None
+
+
+def extract_bits(raw, bits):
+    """Value of a bitfield from the little-endian bytes that cover it."""
+    shift, width, signed = bits
+    v = (int.from_bytes(raw, "little") >> shift) & ((1 << width) - 1)
+    if signed and v >> (width - 1):
+        v -= 1 << width
+    return v
+
+
+def pick_width(addr, size):
+    """Widest aligned access (in bytes) that evenly covers `size` bytes at `addr`.
+    Members of packed structs can be unaligned; a 32-bit access there would fault."""
+    for w in (4, 2, 1):
+        if size % w == 0 and addr % w == 0:
+            return w
+    return 1
+
+
 class Node:
     """A variable, struct member or array element. Children are built lazily."""
     ARRAY_LIMIT = 512
 
-    def __init__(self, label, path, addr, tdie=None, dims=None, leaf=None, typename=None):
+    def __init__(self, label, path, addr, tdie=None, dims=None, leaf=None, typename=None, bits=None):
         self.label, self.path, self.addr = label, path, addr
+        self.bits = bits        # (shift, width, signed) for bitfields; addr/leaf cover the bytes
+        self.rel = None         # byte offset from the root variable (set for members)
         self.tdie = tdie
-        self.d = strip(tdie)
+        self.d = complete(strip(tdie))
         self.arr = None
         self.is_struct = False
         self.leaf = leaf
@@ -225,6 +274,8 @@ class Node:
             self.typename = typename or type_name(et) + "".join(f"[{c}]" for c in ds)
         else:
             self.size = (sizeof(tdie) if tdie is not None else 0) or (self.leaf[0] if self.leaf else 0)
+            if bits:
+                self.size = self.leaf[0]
             self.typename = typename or type_name(tdie)
 
     @property
@@ -249,6 +300,8 @@ class Node:
                     kids.append(Node(f"[{i}]", p, a, et))
         elif self.is_struct:
             kids = self._member_nodes(self.d, 0)
+        for k in kids:
+            k.rel = (self.rel or 0) + (k.addr - self.addr)
         self._kids = kids
         return kids
 
@@ -256,22 +309,58 @@ class Node:
         out = []
         for m in sdie.iter_children():
             if m.tag == "DW_TAG_inheritance":  # C++ base class: flatten its members in
-                bt = strip(target(m))
-                off = attr(m, "DW_AT_data_member_location", 0)
-                if bt is not None and bt.tag in STRUCT_TAGS and isinstance(off, int):
+                bt = complete(strip(target(m)))
+                off = member_offset(m)
+                if bt is not None and bt.tag in STRUCT_TAGS and off is not None:
                     out += self._member_nodes(bt, base_off + off)
                 continue
             if m.tag != "DW_TAG_member":
                 continue
-            # skip bitfields and static members (declarations without an offset)
-            if any(k in m.attributes for k in ("DW_AT_bit_size", "DW_AT_declaration", "DW_AT_external")):
+            if "DW_AT_declaration" in m.attributes or "DW_AT_external" in m.attributes:
+                continue  # static data member: lives elsewhere, listed as its own variable
+            tdie, nm = target(m), die_name(m)
+            width = attr(m, "DW_AT_bit_size")
+            if isinstance(width, int):
+                bn = self._bitfield_node(m, tdie, nm, base_off, width)
+                if bn is not None:
+                    out.append(bn)
                 continue
-            off = attr(m, "DW_AT_data_member_location", 0)
-            if not isinstance(off, int):
+            off = member_offset(m)
+            if off is None:
                 continue
-            nm = die_name(m) or "<anon>"
-            out.append(Node(nm, f"{self.path}.{nm}", self.addr + base_off + off, target(m)))
+            t = complete(strip(tdie))
+            if not nm and t is not None and t.tag in STRUCT_TAGS:
+                out += self._member_nodes(t, base_off + off)   # anonymous struct/union: flatten
+                continue
+            nm = nm or "<anon>"
+            out.append(Node(nm, f"{self.path}.{nm}", self.addr + base_off + off, tdie))
         return out
+
+    def _bitfield_node(self, m, tdie, nm, base_off, width):
+        if not nm or width <= 0:
+            return None  # unnamed padding bits
+        unit = attr(m, "DW_AT_byte_size") or sizeof(tdie) or 4
+        dbo = attr(m, "DW_AT_data_bit_offset")
+        if isinstance(dbo, int):              # DWARF 4/5: bit offset from the start of the struct
+            abs_bit = base_off * 8 + dbo
+        else:                                 # older DWARF: counted from the MSB of the storage unit
+            loc = member_offset(m)
+            if loc is None:
+                return None
+            abs_bit = (base_off + loc) * 8 + (unit * 8 - attr(m, "DW_AT_bit_offset", 0) - width)
+        shift = abs_bit % 8
+        nbytes = (shift + width + 7) // 8
+        if nbytes > 8:
+            return None
+        t = strip(tdie)
+        signed = False
+        if t is not None and t.tag == "DW_TAG_base_type":
+            signed = attr(t, "DW_AT_encoding") in (5, 6)
+        elif t is not None and t.tag == "DW_TAG_enumeration_type":
+            lf = leaf_fmt(t)
+            signed = bool(lf) and lf[1] in SIGNED.values()
+        return Node(nm, f"{self.path}.{nm}", self.addr + abs_bit // 8, tdie, leaf=(nbytes, "I"),
+                    typename=f"{type_name(tdie)}:{width}", bits=(shift, width, signed))
 
 
 def collect_leaves(node, out, limit=64):
@@ -308,8 +397,15 @@ class ElfModel:
 
     def _load_dwarf(self):
         seen = set()
+        pending = []
+        TYPE_INDEX.clear()
         for cu in self.elf.get_dwarf_info().iter_CUs():
             for die in cu.iter_DIEs():
+                if die.tag in STRUCT_TAGS:
+                    nm = die_name(die)
+                    if nm and "DW_AT_declaration" not in die.attributes:
+                        TYPE_INDEX.setdefault((die.tag, nm), die)
+                    continue
                 if die.tag != "DW_TAG_variable":
                     continue
                 addr = var_addr(die)
@@ -322,7 +418,8 @@ class ElfModel:
                 if (name, addr) in seen:
                     continue
                 seen.add((name, addr))
-                self.roots.append(Node(name, name, addr, tdie))
+                pending.append((name, addr, tdie))
+        self.roots.extend(Node(n, n, a, t) for n, a, t in pending)
 
     def _load_symtab(self):
         for sec in self.elf.iter_sections():
@@ -396,14 +493,14 @@ class Poller(QtCore.QThread):
 
     def read_values(self, specs):
         parts = []
-        for _sid, addr, size, _fmt in specs:
-            w = min(size, 4)
+        for _sid, addr, size, _fmt, _bits in specs:
+            w = pick_width(addr, size)
             parts.append(f'append o [read_memory 0x{addr:x} {w * 8} {size // w}] ";"')
         out = self.tcl('set o ""; ' + "; ".join(parts) + "; set o")
         chunks = out.split(";")
         vals = {}
-        for (sid, addr, size, fmt), ch in zip(specs, chunks):
-            w = min(size, 4)
+        for (sid, addr, size, fmt, bits), ch in zip(specs, chunks):
+            w = pick_width(addr, size)
             try:
                 words = [int(x, 0) for x in ch.split()]
             except ValueError:
@@ -411,7 +508,10 @@ class Poller(QtCore.QThread):
             if len(words) != size // w:
                 raise RuntimeError(f"bad reply at 0x{addr:X}: {out[:200]}")
             raw = b"".join(struct.pack("<" + WIDTH[w], x) for x in words)
-            vals[sid] = struct.unpack("<" + fmt, raw)[0]
+            if bits:
+                vals[sid] = extract_bits(raw, bits)
+            else:
+                vals[sid] = struct.unpack("<" + fmt, raw)[0]
         return vals
 
     def run(self):
@@ -538,9 +638,9 @@ def parse_value(text, fmt, enum=None):
 def build_write_cmd(addr, raw):
     """OpenOCD Tcl command(s) that write the bytes in `raw` (little endian) at addr."""
     size = len(raw)
-    if size not in (1, 2, 4, 8):
-        raise ValueError(f"unsupported size {size}")
-    w = min(size, 4)
+    if size < 1:
+        raise ValueError("nothing to write")
+    w = pick_width(addr, size)
     words = struct.unpack("<" + WIDTH[w] * (size // w), raw)
     cmd = {1: "mwb", 2: "mwh", 4: "mww"}[w]
     return "; ".join(f"{cmd} 0x{addr + i * w:x} 0x{word:x}" for i, word in enumerate(words))
@@ -731,6 +831,7 @@ class Series:
         self.last = None
         self.curve = None
         self.enum = None        # {value: name} when the variable is an enum
+        self.bits = None        # (shift, width, signed) when the variable is a bitfield
 
     def enum_active(self):
         return bool(self.enum) and self.fmt not in ("f", "d")
@@ -947,7 +1048,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_filter.setPlaceholderText("Filter variables…")
         self.edit_filter.textChanged.connect(self.apply_filter)
         self.tree = W.QTreeWidget()
-        self.tree.setHeaderLabels(["Variable", "Address", "Size", "Type"])
+        self.tree.setHeaderLabels(["Variable", "Address", "Size", "Type", "Offset / bits"])
         self.tree.setColumnWidth(0, 220)
         self.tree.setColumnWidth(1, 90)
         self.tree.setColumnWidth(2, 45)
@@ -1089,7 +1190,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"{len(self.model.roots)} variables loaded{note}")
 
     def _make_item(self, node):
-        it = QtWidgets.QTreeWidgetItem([node.label, f"0x{node.addr:08X}", str(node.size), node.typename])
+        size = f"{node.bits[1]} bit" if node.bits else str(node.size)
+        if node.rel is None:
+            layout = ""
+        elif node.bits:
+            layout = f"+0x{node.rel:X}  bits {node.bits[0]}..{node.bits[0] + node.bits[1] - 1}"
+        else:
+            layout = f"+0x{node.rel:X}"
+        it = QtWidgets.QTreeWidgetItem([node.label, f"0x{node.addr:08X}", size, node.typename, layout])
         it.setData(0, QtCore.Qt.ItemDataRole.UserRole, node)
         if node.expandable:
             it.addChild(QtWidgets.QTreeWidgetItem(["…"]))  # placeholder, replaced on expand
@@ -1122,7 +1230,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Select a scalar variable (or a struct/array to add its members).")
             return
         for n in leaves:
-            self.add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map)
+            self.add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
 
     def add_by_address(self):
         text, ok = QtWidgets.QInputDialog.getText(self, "Add by address", "Hex address (e.g. 0x20000010):")
@@ -1135,12 +1243,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.add_series(f"mem_{addr:08X}", addr, 4, "I")
 
-    def add_series(self, name, addr, size, fmt, enum=None):
+    def add_series(self, name, addr, size, fmt, enum=None, bits=None):
         if any(s.name == name and s.addr == addr for s in self.series):
             return
         color = COLORS[self.next_id % len(COLORS)]
         s = Series(self.next_id, name, addr, size, fmt, color)
         s.enum = enum
+        s.bits = bits
         self.next_id += 1
         s.curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=name)
         with self.lock:
@@ -1159,11 +1268,15 @@ class MainWindow(QtWidgets.QMainWindow):
         name.setForeground(QtGui.QBrush(QtGui.QColor(s.color)))
         self.table.setItem(r, 1, name)
         self.table.setItem(r, 2, W.QTableWidgetItem(f"0x{s.addr:08X}"))
-        combo = W.QComboBox()
-        combo.addItems(list(TYPES))
-        combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
-        combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
-        self.table.setCellWidget(r, 3, combo)
+        if s.bits:
+            shift, width, signed = s.bits
+            self.table.setCellWidget(r, 3, W.QLabel(f" {'s' if signed else 'u'}{width} bit(s) @ bit {shift}"))
+        else:
+            combo = W.QComboBox()
+            combo.addItems(list(TYPES))
+            combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
+            combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
+            self.table.setCellWidget(r, 3, combo)
         self.table.setCellWidget(r, 4, self._make_offset_widget(s))
         self.table.setItem(r, 5, W.QTableWidgetItem("–"))
         for col in (6, 7, 8):
@@ -1177,7 +1290,13 @@ class MainWindow(QtWidgets.QMainWindow):
         variables, decimal spin box (with the type's precision) for floats."""
         W = QtWidgets
         step = W.QAbstractSpinBox.StepType.AdaptiveDecimalStepType
-        if s.fmt in ("f", "d"):
+        if s.bits:
+            lim = min((1 << s.bits[1]) - 1, 2 ** 31 - 1)
+            w = W.QSpinBox()
+            w.setRange(-lim, lim)
+            w.setStepType(step)
+            w.setValue(int(round(s.offset)))
+        elif s.fmt in ("f", "d"):
             w = W.QDoubleSpinBox()
             w.setDecimals(6 if s.fmt == "f" else 9)
             w.setRange(-1e15, 1e15)
@@ -1228,7 +1347,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def get_specs(self):
         with self.lock:
-            return [(s.id, s.addr, s.size, s.fmt) for s in self.series if s.active]
+            return [(s.id, s.addr, s.size, s.fmt, s.bits) for s in self.series if s.active]
 
     # ---- connection
     def toggle_connect(self):
@@ -1457,6 +1576,11 @@ class MainWindow(QtWidgets.QMainWindow):
         elif 0 <= row < len(self.series):
             s = self.series[row]
         else:
+            return
+        if s.bits:
+            QtWidgets.QMessageBox.information(
+                self, "Bitfield", "Bitfields are read-only: writing one would need a read-modify-write "
+                                  "that can race with the firmware.")
             return
         if self.poller is None:
             QtWidgets.QMessageBox.information(self, "Not connected", "Press Connect first.")
