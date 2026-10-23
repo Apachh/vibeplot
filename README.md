@@ -203,7 +203,3 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 | `swd_liveplot.py` | The application |
 | `run_swdplot.sh` | Launcher that sets up a virtual environment and starts the app |
 | `README.md` | This file |
-
-## License
-
-No license has been chosen yet. Add one before sharing the code publicly.
