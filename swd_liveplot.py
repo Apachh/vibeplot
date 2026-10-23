@@ -956,18 +956,496 @@ class StreamDialog(QtWidgets.QDialog):
             self.lbl_status.setText(sink.describe() + hint)
 
 
+class GraphTab(QtWidgets.QWidget):
+    """One graph: its own plot, cursors, variable table and post-processing panel.
+    Variables are chosen per tab; sampling and the OpenOCD connection are shared via `main`."""
+
+    def __init__(self, main):
+        super().__init__()
+        W = QtWidgets
+        self.main = main
+        self.series = []
+        self._enum_ticks = None
+        self._loading = False
+
+        self.plot = pg.PlotWidget()
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.setLabel("bottom", "time", units="s")
+        self.plot.setClipToView(True)
+        self.plot.setDownsampling(mode="peak", auto=True)
+        self.plot.plotItem.vb.setAutoVisible(y=True)
+        self.legend = self.plot.addLegend()
+        self.table = W.QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(
+            ["Show", "Name", "Address", "Type", "Offset", "Value (dbl-click: write)", "@C1", "@C2",
+             "Δ (C2−C1)", ""])
+        self.table.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
+        for col, wd in ((0, 45), (2, 90), (3, 90), (4, 110), (5, 170), (6, 130), (7, 130), (8, 90), (9, 40)):
+            self.table.setColumnWidth(col, wd)
+        self.table.cellDoubleClicked.connect(lambda r, c: self.edit_value(r) if c == 5 else None)
+        SC = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
+        self.sc_del = SC(QtGui.QKeySequence("Delete"), self.table)
+        self.sc_del.activated.connect(self.remove_selected)
+
+        btn_rm_sel = W.QPushButton("Remove selected (Del)")
+        btn_rm_sel.clicked.connect(self.remove_selected)
+        btn_rm_all = W.QPushButton("Remove all variables")
+        btn_rm_all.clicked.connect(self.remove_all_series)
+        btn_write = W.QPushButton("Write value…")
+        btn_write.setToolTip("Write a new value into the selected variable's memory (needs Connect)")
+        btn_write.clicked.connect(lambda: self.edit_value())
+        rowb = W.QHBoxLayout()
+        rowb.addWidget(btn_write)
+        rowb.addWidget(btn_rm_sel)
+        rowb.addWidget(btn_rm_all)
+        rowb.addStretch(1)
+        tbl_panel = W.QWidget()
+        tl = W.QVBoxLayout(tbl_panel)
+        tl.setContentsMargins(0, 0, 0, 0)
+        self.pp_box = W.QGroupBox("Post-processing of selected variable(s)  (click a row's name to select)")
+        pl = W.QHBoxLayout(self.pp_box)
+        self.lbl_sel = W.QLabel("")
+        self.cmb_mode = W.QComboBox()
+        self.cmb_mode.addItems(MODES)
+        self.spin_param = W.QDoubleSpinBox()
+        self.spin_gain = W.QDoubleSpinBox()
+        self.spin_gain.setRange(-1e9, 1e9)
+        self.spin_gain.setDecimals(6)
+        self.spin_gain.setSingleStep(0.1)
+        self.spin_gain.setValue(1.0)
+        btn_pp_reset = W.QPushButton("Reset")
+        btn_pp_reset.setToolTip("Mode None, gain 1, offset 0 for the selected variable(s)")
+        pl.addWidget(self.lbl_sel, 1)
+        for lbl, wdg in (("Mode", self.cmb_mode), ("N / α", self.spin_param), ("Gain ×", self.spin_gain)):
+            pl.addWidget(W.QLabel(lbl))
+            pl.addWidget(wdg)
+        pl.addWidget(btn_pp_reset)
+        self._configure_param(MODES[0])
+        self.cmb_mode.currentIndexChanged.connect(self.on_mode_changed)
+        self.spin_param.valueChanged.connect(self.on_pp_changed)
+        self.spin_gain.valueChanged.connect(self.on_pp_changed)
+        btn_pp_reset.clicked.connect(self.reset_pp)
+        self.table.itemSelectionChanged.connect(self.on_selection)
+
+        tl.addLayout(rowb)
+        tl.addWidget(self.pp_box)
+        tl.addWidget(self.table)
+        self.on_selection()
+
+        # measurement cursors
+        self.cursor1 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#ffd54f", width=2),
+                                       label="C1 {value:0.3f}s",
+                                       labelOpts={"position": 0.95, "color": "#ffd54f"})
+        self.cursor2 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#4fc3f7", width=2),
+                                       label="C2 {value:0.3f}s",
+                                       labelOpts={"position": 0.88, "color": "#4fc3f7"})
+        for c in (self.cursor1, self.cursor2):
+            c.setVisible(False)
+            self.plot.addItem(c)
+
+        split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.addWidget(self.plot)
+        split.addWidget(tbl_panel)
+        split.setSizes([520, 280])
+        lay = W.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(split)
+
+    # ---- series management
+    def add_series(self, name, addr, size, fmt, enum=None, bits=None):
+        if any(s.name == name and s.addr == addr for s in self.series):
+            return
+        sid = self.main.new_id()
+        color = COLORS[sid % len(COLORS)]
+        s = Series(sid, name, addr, size, fmt, color)
+        s.enum = enum
+        s.bits = bits
+        s.curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=name)
+        with self.main.lock:
+            self.series.append(s)
+        self._add_row(s)
+
+    def _add_row(self, s):
+        W = QtWidgets
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        chk = W.QCheckBox()
+        chk.setChecked(True)
+        chk.toggled.connect(lambda on, s=s: self.set_active(s, on))
+        self.table.setCellWidget(r, 0, chk)
+        name = W.QTableWidgetItem(s.name)
+        name.setForeground(QtGui.QBrush(QtGui.QColor(s.color)))
+        self.table.setItem(r, 1, name)
+        self.table.setItem(r, 2, W.QTableWidgetItem(f"0x{s.addr:08X}"))
+        self.table.setCellWidget(r, 3, self._make_type_widget(s))
+        self.table.setCellWidget(r, 4, self._make_offset_widget(s))
+        self.table.setItem(r, 5, W.QTableWidgetItem("–"))
+        for col in (6, 7, 8):
+            self.table.setItem(r, col, W.QTableWidgetItem(""))
+        btn = W.QPushButton("✕")
+        btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
+        self.table.setCellWidget(r, 9, btn)
+
+    def _make_type_widget(self, s):
+        W = QtWidgets
+        if s.bits:
+            shift, width, signed = s.bits
+            return W.QLabel(f" {'s' if signed else 'u'}{width} bit(s) @ bit {shift}")
+        combo = W.QComboBox()
+        combo.addItems(list(TYPES))
+        combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
+        combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
+        return combo
+
+    def _make_offset_widget(self, s):
+        """Offset editor that matches the variable's type: integer spin box for integer
+        variables, decimal spin box (with the type's precision) for floats."""
+        W = QtWidgets
+        step = W.QAbstractSpinBox.StepType.AdaptiveDecimalStepType
+        if s.bits:
+            lim = min((1 << s.bits[1]) - 1, 2 ** 31 - 1)
+            w = W.QSpinBox()
+            w.setRange(-lim, lim)
+            w.setStepType(step)
+            w.setValue(int(round(s.offset)))
+        elif s.fmt in ("f", "d"):
+            w = W.QDoubleSpinBox()
+            w.setDecimals(6 if s.fmt == "f" else 9)
+            w.setRange(-1e15, 1e15)
+            w.setStepType(step)
+            w.setValue(s.offset)
+        elif s.size <= 4:
+            lim = min((1 << (8 * s.size)) - 1, 2 ** 31 - 1)   # QSpinBox is a 32-bit control
+            w = W.QSpinBox()
+            w.setRange(-lim, lim)
+            w.setStepType(step)
+            w.setValue(int(round(s.offset)))
+        else:                                                  # 64-bit integers
+            w = W.QDoubleSpinBox()
+            w.setDecimals(0)
+            w.setRange(-2.0 ** 53, 2.0 ** 53)                  # exact integer range of a double
+            w.setStepType(step)
+            w.setValue(round(s.offset))
+        s.offset = w.value()                                   # keep the clamped / rounded value
+        w.valueChanged.connect(lambda v, s=s: setattr(s, "offset", v))
+        return w
+
+    def set_active(self, s, on):
+        with self.main.lock:
+            s.active = on
+        s.curve.setVisible(on)
+
+    def set_type(self, s, tname):
+        size, fmt = TYPES[tname]
+        s.type_overridden = True
+        with self.main.lock:
+            s.size, s.fmt = size, fmt
+        s.t.clear()
+        s.y.clear()
+        if s in self.series:
+            self.table.setCellWidget(self.series.index(s), 4, self._make_offset_widget(s))
+
+    def remove_series(self, s):
+        if s not in self.series:
+            return
+        idx = self.series.index(s)
+        with self.main.lock:
+            self.series.pop(idx)
+        self.table.removeRow(idx)
+        self.plot.removeItem(s.curve)
+        try:
+            self.legend.removeItem(s.curve)
+        except Exception:
+            pass
+
+    def remove_selected(self):
+        rows = sorted({ix.row() for ix in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            if r < len(self.series):
+                self.remove_series(self.series[r])
+
+    def remove_all_series(self):
+        for s in list(self.series):
+            self.remove_series(s)
+
+    def remap_series(self):
+        """After an ELF reload: look the variables up by name and move them to their new addresses."""
+        by_name = {}
+        for n in self.main.model.roots:
+            by_name.setdefault(n.label, []).append(n)
+        moved = missing = 0
+        for row, s in enumerate(self.series):
+            if s.name.startswith("mem_") and len(s.name) == 12:
+                continue                                   # added by address: nothing to look up
+            cut = len(s.name)
+            for ch in (".", "["):
+                i = s.name.find(ch)
+                if i != -1:
+                    cut = min(cut, i)
+            best = None
+            for root in by_name.get(s.name[:cut], []):     # same name can exist in several files
+                node = MainWindow._find_node(root, s.name)
+                if node is not None and node.leaf is not None:
+                    if best is None or abs(node.addr - s.addr) < abs(best.addr - s.addr):
+                        best = node
+            if best is None:
+                missing += 1
+                continue
+            with self.main.lock:
+                if best.addr != s.addr:
+                    moved += 1
+                s.addr = best.addr
+                s.enum = best.enum_map
+                if not s.type_overridden:
+                    s.size, s.fmt = best.leaf
+                    s.bits = best.bits
+            self._set_text(row, 2, f"0x{s.addr:08X}")
+            self.table.setCellWidget(row, 3, self._make_type_widget(s))
+            self.table.setCellWidget(row, 4, self._make_offset_widget(s))
+        return moved, missing
+
+    # ---- display
+    @staticmethod
+    def _at(ts, ys, x):
+        """Linear interpolation of a series at time x, or None if x is outside the data."""
+        if ts is None or len(ts) == 0 or x < ts[0] or x > ts[-1]:
+            return None
+        return float(np.interp(x, ts, ys))
+
+    @staticmethod
+    def _step_at(ts, ys, x):
+        """Value of the latest sample at or before x (for enums), or None outside the data."""
+        if ts is None or len(ts) == 0 or x < ts[0] or x > ts[-1]:
+            return None
+        return float(ys[int(np.searchsorted(ts, x, "right")) - 1])
+
+    def _set_text(self, row, col, text):
+        item = self.table.item(row, col)
+        if item is not None:
+            item.setText(text)
+
+    def _update_enum_axis(self):
+        """Label the Y axis with enum names when every visible variable is a plain enum."""
+        act = [s for s in self.series if s.active]
+        ok = bool(act) and all(s.enum_active() and s.mode == "None" and s.gain == 1.0 and s.offset == 0.0
+                               for s in act)
+        ticks = None
+        if ok:
+            merged = {}
+            for s in act:
+                merged.update(s.enum)
+            if len(merged) <= 64:
+                ticks = tuple(sorted(merged.items()))
+        if ticks == self._enum_ticks:
+            return
+        self._enum_ticks = ticks
+        self.plot.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
+
+    def _set_cell(self, row, col, v):
+        item = self.table.item(row, col)
+        if item is not None:
+            item.setText("–" if v is None else f"{v:.6g}")
+
+    def refresh(self, cur, follow, window, t_last):
+        x1, x2 = self.cursor1.value(), self.cursor2.value()
+        for i, s in enumerate(self.series):
+            n = len(s.t)
+            ts = ys = raw = None
+            if n:
+                ts = np.fromiter(s.t, float, n)
+                raw = np.fromiter(s.y, float, n)
+                ys = self.process(s, ts, raw)
+                if s.active:
+                    s.curve.setData(ts, ys)
+            en = s.enum_active()
+            item = self.table.item(i, 5)
+            if item is not None and n:
+                item.setText(s.fmt_enum(raw[-1]) if en else f"{ys[-1]:.6g}")
+            if cur:
+                if en:
+                    a, b = self._step_at(ts, raw, x1), self._step_at(ts, raw, x2)
+                    self._set_text(i, 6, "–" if a is None else s.fmt_enum(a))
+                    self._set_text(i, 7, "–" if b is None else s.fmt_enum(b))
+                    self._set_text(i, 8, "" if a is None or b is None else ("changed" if a != b else "same"))
+                else:
+                    v1, v2 = self._at(ts, ys, x1), self._at(ts, ys, x2)
+                    self._set_cell(i, 6, v1)
+                    self._set_cell(i, 7, v2)
+                    self._set_cell(i, 8, v2 - v1 if v1 is not None and v2 is not None else None)
+        self._update_enum_axis()
+        if cur:
+            dt = x2 - x1
+            freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
+            self.plot.setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
+        if follow and self.series:
+            self.plot.setXRange(max(0.0, t_last - window), max(t_last, 0.1), padding=0)
+
+    def set_follow(self, on):
+        self.plot.plotItem.vb.setAutoVisible(y=on)
+        if on:
+            self.plot.enableAutoRange(axis="y")
+
+    def fit_x(self):
+        """Show the whole recorded time range."""
+        spans = [(s.t[0], s.t[-1]) for s in self.series if s.active and len(s.t)]
+        if spans:
+            lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
+            if hi <= lo:
+                hi = lo + 1.0
+            self.plot.setXRange(lo, hi, padding=0.02)
+
+    def fit_y(self):
+        self.plot.plotItem.vb.setAutoVisible(y=True)
+        self.plot.enableAutoRange(axis="y")
+
+    def set_cursors(self, on):
+        for c in (self.cursor1, self.cursor2):
+            c.setVisible(on)
+        if on:
+            (x0, x1), _ = self.plot.viewRange()
+            self.cursor1.setValue(x0 + 0.35 * (x1 - x0))
+            self.cursor2.setValue(x0 + 0.65 * (x1 - x0))
+        else:
+            self.plot.setTitle(None)
+            for i in range(len(self.series)):
+                for col in (6, 7, 8):
+                    item = self.table.item(i, col)
+                    if item is not None:
+                        item.setText("")
+
+    def clear_data(self):
+        for s in self.series:
+            s.t.clear()
+            s.y.clear()
+            s.last = None
+            s.curve.setData([], [])
+
+    # ---- writing values
+    def edit_value(self, row=None):
+        status = self.main.statusBar().showMessage
+        if row is None:
+            sel = self.selected_series()
+            if not sel:
+                status("Select a variable (click its name) to write a value.")
+                return
+            s = sel[0]
+        elif 0 <= row < len(self.series):
+            s = self.series[row]
+        else:
+            return
+        if s.bits:
+            QtWidgets.QMessageBox.information(
+                self, "Bitfield", "Bitfields are read-only: writing one would need a read-modify-write "
+                                  "that can race with the firmware.")
+            return
+        if self.main.poller is None:
+            QtWidgets.QMessageBox.information(self, "Not connected", "Press Connect first.")
+            return
+        cur = s.last
+        title = f"Write {s.name}"
+        if s.enum_active():
+            items = [f"{nm} ({v})" for v, nm in sorted(s.enum.items())]
+            idx = 0
+            if cur is not None:
+                label = s.fmt_enum(cur)
+                idx = items.index(label) if label in items else 0
+            text, ok = QtWidgets.QInputDialog.getItem(
+                self, title, "Pick an enum value (or type a number):", items, idx, True)
+        else:
+            default = "" if cur is None else (f"{cur:.9g}" if s.fmt in ("f", "d") else str(int(cur)))
+            text, ok = QtWidgets.QInputDialog.getText(
+                self, title, f"New value ({FMT_TO_TYPE.get((s.size, s.fmt), '?')}, "
+                             "decimal or 0x hex; written raw, ignores gain/offset):",
+                text=default)
+        if not ok or not text.strip():
+            return
+        try:
+            value = parse_value(text, s.fmt, s.enum if s.enum_active() else None)
+            raw = struct.pack("<" + s.fmt, value)
+        except (ValueError, struct.error, OverflowError) as e:
+            QtWidgets.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
+            return
+        self.main.poller.request_write(s.name, s.addr, raw)
+
+    # ---- post-processing
+    @staticmethod
+    def process(s, ts, ys):
+        """raw -> filter/transform -> gain -> offset"""
+        y = apply_mode(s.mode, s.param, ts, ys)
+        if s.gain != 1.0 or s.offset != 0.0:
+            y = y * s.gain + s.offset
+        return y
+
+    def selected_series(self):
+        rows = sorted({ix.row() for ix in self.table.selectedIndexes()})
+        return [self.series[r] for r in rows if r < len(self.series)]
+
+    def _configure_param(self, mode, value=None):
+        if mode.startswith("Low-pass"):
+            lo, hi, dec, default, on = 0.001, 1.0, 3, 0.1, True
+        elif mode.startswith("Median"):
+            lo, hi, dec, default, on = 1, 101, 0, 9, True
+        elif mode.startswith("Moving"):
+            lo, hi, dec, default, on = 1, 10000, 0, 10, True
+        else:
+            lo, hi, dec, default, on = 0, 0, 0, 0, False
+        self._loading = True
+        self.spin_param.setDecimals(dec)
+        self.spin_param.setRange(lo, hi)
+        self.spin_param.setValue(default if value is None else value)
+        self.spin_param.setEnabled(on)
+        self._loading = False
+
+    def on_selection(self):
+        sel = self.selected_series()
+        self.pp_box.setEnabled(bool(sel))
+        if not sel:
+            self.lbl_sel.setText("no variable selected")
+            return
+        s = sel[0]
+        self.lbl_sel.setText(", ".join(x.name for x in sel[:3]) + (" …" if len(sel) > 3 else ""))
+        self._loading = True
+        self.cmb_mode.setCurrentText(s.mode)
+        self.spin_gain.setValue(s.gain)
+        self._loading = False
+        self._configure_param(s.mode, s.param)
+
+    def on_mode_changed(self, _i=0):
+        if self._loading:
+            return
+        self._configure_param(self.cmb_mode.currentText())
+        self.on_pp_changed()
+
+    def on_pp_changed(self, *_):
+        if self._loading:
+            return
+        mode, p, g = self.cmb_mode.currentText(), self.spin_param.value(), self.spin_gain.value()
+        for s in self.selected_series():
+            s.mode, s.param, s.gain = mode, p, g
+
+    def reset_pp(self):
+        for s in self.selected_series():
+            s.mode, s.param, s.gain = "None", 10.0, 1.0
+            sp = self.table.cellWidget(self.series.index(s), 4)
+            if sp is not None:
+                sp.setValue(0)
+        self.on_selection()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SWD Live Plot")
         self.model = None
-        self.series = []
         self.lock = threading.Lock()
         self.poller = None
         self.next_id = 0
+        self._tab_no = 0
         self.t_last = 0.0
         self.follow = True
-        self._enum_ticks = None
         self.elf_path = None
         self._elf_sig = None
         self._elf_pending = None
@@ -1071,7 +1549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setSelectionMode(W.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemExpanded.connect(self.on_expand)
         self.tree.itemDoubleClicked.connect(lambda it, _c: self.add_items([it]))
-        btn_add = W.QPushButton("Add selected to plot ▶")
+        btn_add = W.QPushButton("Add selected to current tab ▶")
         btn_add.clicked.connect(lambda: self.add_items(self.tree.selectedItems()))
         btn_addr = W.QPushButton("Add by address…")
         btn_addr.clicked.connect(self.add_by_address)
@@ -1082,94 +1560,23 @@ class MainWindow(QtWidgets.QMainWindow):
         ll.addWidget(self.tree, 1)
         ll.addLayout(row)
 
-        # right: plot + series table
-        self.plot = pg.PlotWidget()
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.plot.setLabel("bottom", "time", units="s")
-        self.plot.setClipToView(True)
-        self.plot.setDownsampling(mode="peak", auto=True)
-        self.plot.plotItem.vb.setAutoVisible(y=True)
-        self.legend = self.plot.addLegend()
-        self.table = W.QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(
-            ["Show", "Name", "Address", "Type", "Offset", "Value (dbl-click: write)", "@C1", "@C2",
-             "Δ (C2−C1)", ""])
-        self.table.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
-        for col, wd in ((0, 45), (2, 90), (3, 90), (4, 110), (5, 170), (6, 130), (7, 130), (8, 90), (9, 40)):
-            self.table.setColumnWidth(col, wd)
-        self.table.cellDoubleClicked.connect(lambda r, c: self.edit_value(r) if c == 5 else None)
-        SC = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
-        self.sc_del = SC(QtGui.QKeySequence("Delete"), self.table)
-        self.sc_del.activated.connect(self.remove_selected)
-
-        btn_rm_sel = W.QPushButton("Remove selected (Del)")
-        btn_rm_sel.clicked.connect(self.remove_selected)
-        btn_rm_all = W.QPushButton("Remove all variables")
-        btn_rm_all.clicked.connect(self.remove_all_series)
-        btn_write = W.QPushButton("Write value…")
-        btn_write.setToolTip("Write a new value into the selected variable's memory (needs Connect)")
-        btn_write.clicked.connect(lambda: self.edit_value())
-        rowb = W.QHBoxLayout()
-        rowb.addWidget(btn_write)
-        rowb.addWidget(btn_rm_sel)
-        rowb.addWidget(btn_rm_all)
-        rowb.addStretch(1)
-        tbl_panel = W.QWidget()
-        tl = W.QVBoxLayout(tbl_panel)
-        tl.setContentsMargins(0, 0, 0, 0)
-        self._loading = False
-        self.pp_box = W.QGroupBox("Post-processing of selected variable(s)  (click a row's name to select)")
-        pl = W.QHBoxLayout(self.pp_box)
-        self.lbl_sel = W.QLabel("")
-        self.cmb_mode = W.QComboBox()
-        self.cmb_mode.addItems(MODES)
-        self.spin_param = W.QDoubleSpinBox()
-        self.spin_gain = W.QDoubleSpinBox()
-        self.spin_gain.setRange(-1e9, 1e9)
-        self.spin_gain.setDecimals(6)
-        self.spin_gain.setSingleStep(0.1)
-        self.spin_gain.setValue(1.0)
-        btn_pp_reset = W.QPushButton("Reset")
-        btn_pp_reset.setToolTip("Mode None, gain 1, offset 0 for the selected variable(s)")
-        pl.addWidget(self.lbl_sel, 1)
-        for lbl, wdg in (("Mode", self.cmb_mode), ("N / α", self.spin_param), ("Gain ×", self.spin_gain)):
-            pl.addWidget(W.QLabel(lbl))
-            pl.addWidget(wdg)
-        pl.addWidget(btn_pp_reset)
-        self._configure_param(MODES[0])
-        self.cmb_mode.currentIndexChanged.connect(self.on_mode_changed)
-        self.spin_param.valueChanged.connect(self.on_pp_changed)
-        self.spin_gain.valueChanged.connect(self.on_pp_changed)
-        btn_pp_reset.clicked.connect(self.reset_pp)
-        self.table.itemSelectionChanged.connect(self.on_selection)
-
-        tl.addLayout(rowb)
-        tl.addWidget(self.pp_box)
-        tl.addWidget(self.table)
-        self.on_selection()
-
-        # measurement cursors
-        self.cursor1 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#ffd54f", width=2),
-                                       label="C1 {value:0.3f}s",
-                                       labelOpts={"position": 0.95, "color": "#ffd54f"})
-        self.cursor2 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#4fc3f7", width=2),
-                                       label="C2 {value:0.3f}s",
-                                       labelOpts={"position": 0.88, "color": "#4fc3f7"})
-        for c in (self.cursor1, self.cursor2):
-            c.setVisible(False)
-            self.plot.addItem(c)
-
-        right = W.QSplitter(QtCore.Qt.Orientation.Vertical)
-        right.addWidget(self.plot)
-        right.addWidget(tbl_panel)
-        right.setSizes([520, 280])
+        # right: tabs, each with its own plot and variable table
+        self.tabs = W.QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBar().tabBarDoubleClicked.connect(self.rename_tab)
+        self.tabs.tabBar().setToolTip("Double-click a tab to rename it")
+        btn_new_tab = W.QToolButton()
+        btn_new_tab.setText("＋")
+        btn_new_tab.setToolTip("New graph tab")
+        btn_new_tab.clicked.connect(lambda: self.add_tab())
+        self.tabs.setCornerWidget(btn_new_tab, QtCore.Qt.Corner.TopRightCorner)
+        self.add_tab()
 
         split = W.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.addWidget(left)
-        split.addWidget(right)
+        split.addWidget(self.tabs)
         split.setSizes([420, 980])
 
         central = W.QWidget()
@@ -1230,10 +1637,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.load_elf(self.elf_path, quiet=auto):
             return
-        if not self.series:
+        total = len(self.series)
+        if not total:
             return
-        moved, missing = self.remap_series()
-        msg = f"ELF reloaded ({len(self.model.roots)} variables): {len(self.series) - missing} plotted variable(s) updated"
+        moved = missing = 0
+        for tab in self.all_tabs():
+            m, x = tab.remap_series()
+            moved += m
+            missing += x
+        msg = f"ELF reloaded ({len(self.model.roots)} variables): {total - missing} plotted variable(s) updated"
         if moved:
             msg += f", {moved} moved to a new address"
         if missing:
@@ -1272,40 +1684,6 @@ class MainWindow(QtWidgets.QMainWindow):
             node = nxt
         return node
 
-    def remap_series(self):
-        by_name = {}
-        for n in self.model.roots:
-            by_name.setdefault(n.label, []).append(n)
-        moved = missing = 0
-        for row, s in enumerate(self.series):
-            if s.name.startswith("mem_") and len(s.name) == 12:
-                continue                                   # added by address: nothing to look up
-            cut = len(s.name)
-            for ch in (".", "["):
-                i = s.name.find(ch)
-                if i != -1:
-                    cut = min(cut, i)
-            best = None
-            for root in by_name.get(s.name[:cut], []):     # same name can exist in several files
-                node = self._find_node(root, s.name)
-                if node is not None and node.leaf is not None:
-                    if best is None or abs(node.addr - s.addr) < abs(best.addr - s.addr):
-                        best = node
-            if best is None:
-                missing += 1
-                continue
-            with self.lock:
-                if best.addr != s.addr:
-                    moved += 1
-                s.addr = best.addr
-                s.enum = best.enum_map
-                if not s.type_overridden:
-                    s.size, s.fmt = best.leaf
-                    s.bits = best.bits
-            self._set_text(row, 2, f"0x{s.addr:08X}")
-            self.table.setCellWidget(row, 3, self._make_type_widget(s))
-            self.table.setCellWidget(row, 4, self._make_offset_widget(s))
-        return moved, missing
 
     def _make_item(self, node):
         size = f"{node.bits[1]} bit" if node.bits else str(node.size)
@@ -1348,7 +1726,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Select a scalar variable (or a struct/array to add its members).")
             return
         for n in leaves:
-            self.add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
+            self.current_tab().add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
 
     def add_by_address(self):
         text, ok = QtWidgets.QInputDialog.getText(self, "Add by address", "Hex address (e.g. 0x20000010):")
@@ -1359,113 +1737,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             QtWidgets.QMessageBox.warning(self, "Bad address", "Could not parse the address.")
             return
-        self.add_series(f"mem_{addr:08X}", addr, 4, "I")
-
-    def add_series(self, name, addr, size, fmt, enum=None, bits=None):
-        if any(s.name == name and s.addr == addr for s in self.series):
-            return
-        color = COLORS[self.next_id % len(COLORS)]
-        s = Series(self.next_id, name, addr, size, fmt, color)
-        s.enum = enum
-        s.bits = bits
-        self.next_id += 1
-        s.curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=name)
-        with self.lock:
-            self.series.append(s)
-        self._add_row(s)
-
-    def _add_row(self, s):
-        W = QtWidgets
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        chk = W.QCheckBox()
-        chk.setChecked(True)
-        chk.toggled.connect(lambda on, s=s: self.set_active(s, on))
-        self.table.setCellWidget(r, 0, chk)
-        name = W.QTableWidgetItem(s.name)
-        name.setForeground(QtGui.QBrush(QtGui.QColor(s.color)))
-        self.table.setItem(r, 1, name)
-        self.table.setItem(r, 2, W.QTableWidgetItem(f"0x{s.addr:08X}"))
-        self.table.setCellWidget(r, 3, self._make_type_widget(s))
-        self.table.setCellWidget(r, 4, self._make_offset_widget(s))
-        self.table.setItem(r, 5, W.QTableWidgetItem("–"))
-        for col in (6, 7, 8):
-            self.table.setItem(r, col, W.QTableWidgetItem(""))
-        btn = W.QPushButton("✕")
-        btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
-        self.table.setCellWidget(r, 9, btn)
-
-    def _make_type_widget(self, s):
-        W = QtWidgets
-        if s.bits:
-            shift, width, signed = s.bits
-            return W.QLabel(f" {'s' if signed else 'u'}{width} bit(s) @ bit {shift}")
-        combo = W.QComboBox()
-        combo.addItems(list(TYPES))
-        combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
-        combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
-        return combo
-
-    def _make_offset_widget(self, s):
-        """Offset editor that matches the variable's type: integer spin box for integer
-        variables, decimal spin box (with the type's precision) for floats."""
-        W = QtWidgets
-        step = W.QAbstractSpinBox.StepType.AdaptiveDecimalStepType
-        if s.bits:
-            lim = min((1 << s.bits[1]) - 1, 2 ** 31 - 1)
-            w = W.QSpinBox()
-            w.setRange(-lim, lim)
-            w.setStepType(step)
-            w.setValue(int(round(s.offset)))
-        elif s.fmt in ("f", "d"):
-            w = W.QDoubleSpinBox()
-            w.setDecimals(6 if s.fmt == "f" else 9)
-            w.setRange(-1e15, 1e15)
-            w.setStepType(step)
-            w.setValue(s.offset)
-        elif s.size <= 4:
-            lim = min((1 << (8 * s.size)) - 1, 2 ** 31 - 1)   # QSpinBox is a 32-bit control
-            w = W.QSpinBox()
-            w.setRange(-lim, lim)
-            w.setStepType(step)
-            w.setValue(int(round(s.offset)))
-        else:                                                  # 64-bit integers
-            w = W.QDoubleSpinBox()
-            w.setDecimals(0)
-            w.setRange(-2.0 ** 53, 2.0 ** 53)                  # exact integer range of a double
-            w.setStepType(step)
-            w.setValue(round(s.offset))
-        s.offset = w.value()                                   # keep the clamped / rounded value
-        w.valueChanged.connect(lambda v, s=s: setattr(s, "offset", v))
-        return w
-
-    def set_active(self, s, on):
-        with self.lock:
-            s.active = on
-        s.curve.setVisible(on)
-
-    def set_type(self, s, tname):
-        size, fmt = TYPES[tname]
-        s.type_overridden = True
-        with self.lock:
-            s.size, s.fmt = size, fmt
-        s.t.clear()
-        s.y.clear()
-        if s in self.series:
-            self.table.setCellWidget(self.series.index(s), 4, self._make_offset_widget(s))
-
-    def remove_series(self, s):
-        if s not in self.series:
-            return
-        idx = self.series.index(s)
-        with self.lock:
-            self.series.pop(idx)
-        self.table.removeRow(idx)
-        self.plot.removeItem(s.curve)
-        try:
-            self.legend.removeItem(s.curve)
-        except Exception:
-            pass
+        self.current_tab().add_series(f"mem_{addr:08X}", addr, 4, "I")
 
     def get_specs(self):
         with self.lock:
@@ -1503,131 +1775,85 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.last = v
         self.stream_sample(t, values)
 
-    # ---- display
-    @staticmethod
-    def _at(ts, ys, x):
-        """Linear interpolation of a series at time x, or None if x is outside the data."""
-        if ts is None or len(ts) == 0 or x < ts[0] or x > ts[-1]:
-            return None
-        return float(np.interp(x, ts, ys))
+    # ---- tabs
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id - 1
 
-    @staticmethod
-    def _step_at(ts, ys, x):
-        """Value of the latest sample at or before x (for enums), or None outside the data."""
-        if ts is None or len(ts) == 0 or x < ts[0] or x > ts[-1]:
-            return None
-        return float(ys[int(np.searchsorted(ts, x, "right")) - 1])
+    @property
+    def series(self):
+        return [s for tab in self.all_tabs() for s in tab.series]
 
-    def _set_text(self, row, col, text):
-        item = self.table.item(row, col)
-        if item is not None:
-            item.setText(text)
+    def all_tabs(self):
+        return [self.tabs.widget(i) for i in range(self.tabs.count())]
 
-    def _update_enum_axis(self):
-        """Label the Y axis with enum names when every visible variable is a plain enum."""
-        act = [s for s in self.series if s.active]
-        ok = bool(act) and all(s.enum_active() and s.mode == "None" and s.gain == 1.0 and s.offset == 0.0
-                               for s in act)
-        ticks = None
-        if ok:
-            merged = {}
-            for s in act:
-                merged.update(s.enum)
-            if len(merged) <= 64:
-                ticks = tuple(sorted(merged.items()))
-        if ticks == self._enum_ticks:
+    def current_tab(self):
+        return self.tabs.currentWidget()
+
+    def add_tab(self, title=None):
+        tab = GraphTab(self)
+        self._tab_no += 1
+        i = self.tabs.addTab(tab, title or f"Graph {self._tab_no}")
+        self.tabs.setCurrentIndex(i)
+        tab.set_follow(self.follow)
+        if hasattr(self, "btn_cursors") and self.btn_cursors.isChecked():
+            tab.set_cursors(True)
+        return tab
+
+    def close_tab(self, i):
+        if self.tabs.count() <= 1:
+            self.statusBar().showMessage("Keep at least one graph tab.")
             return
-        self._enum_ticks = ticks
-        self.plot.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
+        tab = self.tabs.widget(i)
+        if tab.series and QtWidgets.QMessageBox.question(
+                self, "Close tab", f"Close '{self.tabs.tabText(i)}' and remove its {len(tab.series)} "
+                                   "variable(s)?") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        tab.remove_all_series()
+        self.tabs.removeTab(i)
+        tab.deleteLater()
 
-    def _set_cell(self, row, col, v):
-        item = self.table.item(row, col)
-        if item is not None:
-            item.setText("–" if v is None else f"{v:.6g}")
+    def rename_tab(self, i):
+        if i < 0:
+            return
+        text, ok = QtWidgets.QInputDialog.getText(self, "Rename tab", "Tab name:", text=self.tabs.tabText(i))
+        if ok and text.strip():
+            self.tabs.setTabText(i, text.strip())
 
+    # ---- display
     def refresh(self):
         self._tick += 1
         if self._tick % 20 == 0:
             self._check_elf()
         cur = self.btn_cursors.isChecked()
-        x1, x2 = self.cursor1.value(), self.cursor2.value()
-        for i, s in enumerate(self.series):
-            n = len(s.t)
-            ts = ys = raw = None
-            if n:
-                ts = np.fromiter(s.t, float, n)
-                raw = np.fromiter(s.y, float, n)
-                ys = self.process(s, ts, raw)
-                if s.active:
-                    s.curve.setData(ts, ys)
-            en = s.enum_active()
-            item = self.table.item(i, 5)
-            if item is not None and n:
-                item.setText(s.fmt_enum(raw[-1]) if en else f"{ys[-1]:.6g}")
-            if cur:
-                if en:
-                    a, b = self._step_at(ts, raw, x1), self._step_at(ts, raw, x2)
-                    self._set_text(i, 6, "–" if a is None else s.fmt_enum(a))
-                    self._set_text(i, 7, "–" if b is None else s.fmt_enum(b))
-                    self._set_text(i, 8, "" if a is None or b is None else ("changed" if a != b else "same"))
-                else:
-                    v1, v2 = self._at(ts, ys, x1), self._at(ts, ys, x2)
-                    self._set_cell(i, 6, v1)
-                    self._set_cell(i, 7, v2)
-                    self._set_cell(i, 8, v2 - v1 if v1 is not None and v2 is not None else None)
-        self._update_enum_axis()
+        window = self.spin_window.value()
+        for tab in self.all_tabs():
+            tab.refresh(cur, self.follow, window, self.t_last)
         self._update_stream_ui()
-        if cur:
-            dt = x2 - x1
-            freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
-            self.plot.setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
-        if self.follow and self.series:
-            hi = self.t_last
-            self.plot.setXRange(max(0.0, hi - self.spin_window.value()), max(hi, 0.1), padding=0)
 
     def set_follow(self, on):
         self.follow = on
-        self.plot.plotItem.vb.setAutoVisible(y=on)
-        if on:
-            self.plot.enableAutoRange(axis="y")
+        for tab in self.all_tabs():
+            tab.set_follow(on)
 
     def fit_view(self):
-        """Fit X: show the whole recorded time range and stop following."""
+        """Fit X: show the whole recorded time range of the current tab and stop following."""
         self.btn_follow.setChecked(False)
         self.follow = False
-        spans = [(s.t[0], s.t[-1]) for s in self.series if s.active and len(s.t)]
-        if spans:
-            lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
-            if hi <= lo:
-                hi = lo + 1.0
-            self.plot.setXRange(lo, hi, padding=0.02)
+        self.current_tab().fit_x()
+
+    def fit_y(self):
+        self.current_tab().fit_y()
 
     def set_cursors(self, on):
-        for c in (self.cursor1, self.cursor2):
-            c.setVisible(on)
         if on:
             self.btn_follow.setChecked(False)
-            (x0, x1), _ = self.plot.viewRange()
-            self.cursor1.setValue(x0 + 0.35 * (x1 - x0))
-            self.cursor2.setValue(x0 + 0.65 * (x1 - x0))
-        else:
-            self.plot.setTitle(None)
-            for i in range(len(self.series)):
-                for col in (6, 7, 8):
-                    item = self.table.item(i, col)
-                    if item is not None:
-                        item.setText("")
+        for tab in self.all_tabs():
+            tab.set_cursors(on)
 
-    def remove_selected(self):
-        rows = sorted({ix.row() for ix in self.table.selectedIndexes()}, reverse=True)
-        for r in rows:
-            if r < len(self.series):
-                self.remove_series(self.series[r])
-
-    def remove_all_series(self):
-        for s in list(self.series):
-            self.remove_series(s)
-
+    def clear_data(self):
+        for tab in self.all_tabs():
+            tab.clear_data()
     # ---- streaming
     def show_stream(self):
         if self.stream_dlg is None:
@@ -1663,7 +1889,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stream_n += 1
         if cfg["every"] > 1 and (self._stream_n - 1) % cfg["every"]:
             return
-        cols = [s for s in self.series if s.id in values]
+        cols, seen = [], set()
+        for s in self.series:                    # a variable plotted in several tabs is sent once
+            if s.id in values and s.name not in seen:
+                seen.add(s.name)
+                cols.append(s)
         if not cols:
             return
         scaled = cfg["scaled"]
@@ -1694,144 +1924,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stream_dlg is not None and self.stream_dlg.isVisible():
             self.stream_dlg.update_status()
 
-    # ---- writing values
-    def edit_value(self, row=None):
-        if row is None:
-            sel = self.selected_series()
-            if not sel:
-                self.statusBar().showMessage("Select a variable (click its name) to write a value.")
-                return
-            s = sel[0]
-        elif 0 <= row < len(self.series):
-            s = self.series[row]
-        else:
-            return
-        if s.bits:
-            QtWidgets.QMessageBox.information(
-                self, "Bitfield", "Bitfields are read-only: writing one would need a read-modify-write "
-                                  "that can race with the firmware.")
-            return
-        if self.poller is None:
-            QtWidgets.QMessageBox.information(self, "Not connected", "Press Connect first.")
-            return
-        cur = s.last
-        title = f"Write {s.name}"
-        if s.enum_active():
-            items = [f"{nm} ({v})" for v, nm in sorted(s.enum.items())]
-            idx = 0
-            if cur is not None:
-                label = s.fmt_enum(cur)
-                idx = items.index(label) if label in items else 0
-            text, ok = QtWidgets.QInputDialog.getItem(
-                self, title, "Pick an enum value (or type a number):", items, idx, True)
-        else:
-            default = "" if cur is None else (f"{cur:.9g}" if s.fmt in ("f", "d") else str(int(cur)))
-            text, ok = QtWidgets.QInputDialog.getText(
-                self, title, f"New value ({FMT_TO_TYPE.get((s.size, s.fmt), '?')}, "
-                             "decimal or 0x hex; written raw, ignores gain/offset):",
-                text=default)
-        if not ok or not text.strip():
-            return
-        try:
-            value = parse_value(text, s.fmt, s.enum if s.enum_active() else None)
-            raw = struct.pack("<" + s.fmt, value)
-        except (ValueError, struct.error, OverflowError) as e:
-            QtWidgets.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
-            return
-        self.poller.request_write(s.name, s.addr, raw)
-
-    # ---- vertical fit
-    def fit_y(self):
-        self.plot.plotItem.vb.setAutoVisible(y=True)
-        self.plot.enableAutoRange(axis="y")
-
-    # ---- post-processing
-    @staticmethod
-    def process(s, ts, ys):
-        """raw -> filter/transform -> gain -> offset"""
-        y = apply_mode(s.mode, s.param, ts, ys)
-        if s.gain != 1.0 or s.offset != 0.0:
-            y = y * s.gain + s.offset
-        return y
-
-    def selected_series(self):
-        rows = sorted({ix.row() for ix in self.table.selectedIndexes()})
-        return [self.series[r] for r in rows if r < len(self.series)]
-
-    def _configure_param(self, mode, value=None):
-        if mode.startswith("Low-pass"):
-            lo, hi, dec, default, on = 0.001, 1.0, 3, 0.1, True
-        elif mode.startswith("Median"):
-            lo, hi, dec, default, on = 1, 101, 0, 9, True
-        elif mode.startswith("Moving"):
-            lo, hi, dec, default, on = 1, 10000, 0, 10, True
-        else:
-            lo, hi, dec, default, on = 0, 0, 0, 0, False
-        self._loading = True
-        self.spin_param.setDecimals(dec)
-        self.spin_param.setRange(lo, hi)
-        self.spin_param.setValue(default if value is None else value)
-        self.spin_param.setEnabled(on)
-        self._loading = False
-
-    def on_selection(self):
-        sel = self.selected_series()
-        self.pp_box.setEnabled(bool(sel))
-        if not sel:
-            self.lbl_sel.setText("no variable selected")
-            return
-        s = sel[0]
-        self.lbl_sel.setText(", ".join(x.name for x in sel[:3]) + (" …" if len(sel) > 3 else ""))
-        self._loading = True
-        self.cmb_mode.setCurrentText(s.mode)
-        self.spin_gain.setValue(s.gain)
-        self._loading = False
-        self._configure_param(s.mode, s.param)
-
-    def on_mode_changed(self, _i=0):
-        if self._loading:
-            return
-        self._configure_param(self.cmb_mode.currentText())
-        self.on_pp_changed()
-
-    def on_pp_changed(self, *_):
-        if self._loading:
-            return
-        mode, p, g = self.cmb_mode.currentText(), self.spin_param.value(), self.spin_gain.value()
-        for s in self.selected_series():
-            s.mode, s.param, s.gain = mode, p, g
-
-    def reset_pp(self):
-        for s in self.selected_series():
-            s.mode, s.param, s.gain = "None", 10.0, 1.0
-            sp = self.table.cellWidget(self.series.index(s), 4)
-            if sp is not None:
-                sp.setValue(0)
-        self.on_selection()
-
-    def clear_data(self):
-        for s in self.series:
-            s.t.clear()
-            s.y.clear()
-            s.last = None
-            s.curve.setData([], [])
-
     def export_csv(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV", "samples.csv", "CSV (*.csv)")
         if not path:
             return
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["variable", "time_s", "raw", "processed"])
-            for s in self.series:
-                n = len(s.t)
-                if not n:
-                    continue
-                ts = np.fromiter(s.t, float, n)
-                raw = np.fromiter(s.y, float, n)
-                proc = self.process(s, ts, raw)
-                for t, r, p in zip(ts, raw, proc):
-                    w.writerow([s.name, f"{t:.6f}", r, p])
+            w.writerow(["variable", "time_s", "raw", "processed", "tab"])
+            for i, tab in enumerate(self.all_tabs()):
+                for s in tab.series:
+                    n = len(s.t)
+                    if not n:
+                        continue
+                    ts = np.fromiter(s.t, float, n)
+                    raw = np.fromiter(s.y, float, n)
+                    proc = tab.process(s, ts, raw)
+                    for t, r, p in zip(ts, raw, proc):
+                        w.writerow([s.name, f"{t:.6f}", r, p, self.tabs.tabText(i)])
         self.statusBar().showMessage(f"Saved {path}")
 
     def closeEvent(self, ev):
