@@ -27,6 +27,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 - Enums are shown by name in the table, at the cursors and on the Y axis.
 - **Stream** the plotted data live to a virtual COM port, a real serial port or a file (CSV, Teleplot or JSON lines), for comparison with another program.
 - Export recorded data to CSV (raw and processed).
+- Notices when the ELF is rebuilt and reloads it, keeping your plotted variables (matched by name) and moving them to their new addresses.
 - Dark theme.
 
 ## Requirements
@@ -64,6 +65,7 @@ A plain `pip install` outside a virtual environment fails on many Linux distribu
 3. Start the app and open your ELF (**Open ELF…** or pass it on the command line).
 4. Enter the Tcl port in the top bar and press **Connect**.
 5. Filter the variable list and double-click the variables you want. They appear on the graph.
+6. After rebuilding the firmware the app reloads the ELF by itself (see **Reload ELF**). Remember to flash the new firmware as well, because addresses in the running target only change after you flash it.
 
 ### Finding the Tcl port
 
@@ -73,7 +75,7 @@ Cortex-Debug chooses the OpenOCD ports for each debug session. Look at the OpenO
 /usr/bin/openocd -c "gdb_port 50000" -c "tcl_port 50001" -c "telnet_port 50002" ...
 ```
 
-Use the **Tcl** port (`50001` here), not the GDB or telnet port. The app's default is 6666, OpenOCD's standard Tcl port, which Cortex-Debug does not normally use. The port can change between sessions; the OpenOCD output also contains a line like `Listening on port 50001 for tcl connections`.
+Use the **Tcl** port (`50001` here), not the GDB or telnet port. The app's default is 50001 (the Tcl port in the example above). The port is chosen by Cortex-Debug and can change between sessions, so adjust it if Connect fails; the OpenOCD output also contains a line like `Listening on port 50001 for tcl connections`.
 
 The ST-Link can only be owned by one OpenOCD at a time, so this tool must connect to Cortex-Debug's OpenOCD rather than start its own.
 
@@ -84,12 +86,13 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 | Control | What it does |
 |---|---|
 | Open ELF… | Load a firmware ELF and list its variables |
+| Reload ELF, Auto | Re-read the ELF after a rebuild and move the plotted variables to their new addresses. With **Auto** ticked (default) this happens by itself when the file changes on disk; otherwise the button turns into `Reload ELF ●` and the file name turns orange |
 | Host / port, Connect | Connect to (or disconnect from) OpenOCD's Tcl port |
 | Period | Target time between reads, in ms (the real rate is limited by the probe) |
 | Window | Seconds of history shown while following |
 | Follow live | Scroll the view with the newest data |
-| Fit | Fit all data in both axes (stops following) |
-| Fit Y | Fit the vertical range to the data in the visible time range |
+| Fit X | Show the whole recorded time range (stops following) |
+| Fit Y | Fit the vertical range to the data in the visible time range (use with Fit X to fit both axes) |
 | Cursors | Show two measurement cursors (stops following so the view stays still) |
 | Clear data | Delete the recorded samples, keep the variables |
 | Export CSV… | Save the recorded data (`variable, time_s, raw, processed`) |
@@ -185,7 +188,8 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 
 | Problem | Check |
 |---|---|
-| "Cannot connect" | Wrong port (use the Tcl port), OpenOCD not running, or the debug session ended |
+| "Cannot connect" | Wrong port (use the Tcl port, default 50001), OpenOCD not running, or the debug session ended |
+| Values wrong right after a rebuild | The ELF was reloaded but the target still runs the old firmware; flash and restart the debug session |
 | Read error with an OpenOCD message | OpenOCD older than 0.10, or the address is not readable memory |
 | Struct or class fields missing | Rebuild with `-g` (and a recent GCC); bitfields, base classes and anonymous unions are supported, virtual bases are not |
 | Variable missing from the list | Built without `-g`, optimized away, local variable, or clang DWARF 5 (see above) |

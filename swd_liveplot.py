@@ -14,6 +14,7 @@ Run:       python swd_liveplot.py [firmware.elf]
 """
 import csv
 import errno
+import io
 import json
 import os
 import queue
@@ -377,7 +378,8 @@ def collect_leaves(node, out, limit=64):
 
 class ElfModel:
     def __init__(self, path):
-        self.file = open(path, "rb")
+        with open(path, "rb") as f:
+            self.file = io.BytesIO(f.read())   # in memory: the build can overwrite the file freely
         self.elf = ELFFile(self.file)
         self.roots = []
         self.has_debug = False
@@ -832,6 +834,7 @@ class Series:
         self.curve = None
         self.enum = None        # {value: name} when the variable is an enum
         self.bits = None        # (shift, width, signed) when the variable is a bitfield
+        self.type_overridden = False   # user picked the type by hand: keep it on ELF reload
 
     def enum_active(self):
         return bool(self.enum) and self.fmt not in ("f", "d")
@@ -965,6 +968,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t_last = 0.0
         self.follow = True
         self._enum_ticks = None
+        self.elf_path = None
+        self._elf_sig = None
+        self._elf_pending = None
+        self._tick = 0
         self.stream_dlg = None
         self.sink = None
         self.stream_cfg = None
@@ -983,6 +990,12 @@ class MainWindow(QtWidgets.QMainWindow):
         top = W.QHBoxLayout()
         self.btn_open = W.QPushButton("Open ELF…")
         self.btn_open.clicked.connect(self.open_elf)
+        self.btn_reload = W.QPushButton("Reload ELF")
+        self.btn_reload.setToolTip("Re-read the ELF and move the plotted variables to their new addresses")
+        self.btn_reload.clicked.connect(lambda: self.reload_elf())
+        self.chk_auto_elf = W.QCheckBox("Auto")
+        self.chk_auto_elf.setChecked(True)
+        self.chk_auto_elf.setToolTip("Reload automatically when the ELF file changes on disk (after a rebuild)")
         self.lbl_elf = W.QLabel("no file loaded")
         self.edit_host = W.QLineEdit("localhost")
         self.edit_host.setFixedWidth(100)
@@ -1006,7 +1019,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_follow.setToolTip("Scroll the view with the newest data")
         self.btn_follow.toggled.connect(self.set_follow)
         self.btn_fit = W.QPushButton("Fit X")
-        self.btn_fit.setToolTip("Fit all data into the view (stops following)")
+        self.btn_fit.setToolTip("Show the whole recorded time range (stops following). Use Fit Y for the vertical axis.")
         self.btn_fit.clicked.connect(self.fit_view)
         self.btn_fit_y = QtWidgets.QPushButton("Fit Y")
         self.btn_fit_y.setToolTip("Fit the vertical range to the data visible in the current time range")
@@ -1023,6 +1036,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stream.setToolTip("Send the plotted values live to a virtual COM port, serial port or file")
         self.btn_stream.clicked.connect(self.show_stream)
         top.addWidget(self.btn_open)
+        top.addWidget(self.btn_reload)
+        top.addWidget(self.chk_auto_elf)
         top.addWidget(self.lbl_elf, 1)
         for lbl, w in (("OpenOCD Tcl host", self.edit_host), ("port", self.spin_port)):
             top.addWidget(W.QLabel(lbl))
@@ -1171,23 +1186,126 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.load_elf(path)
 
-    def load_elf(self, path):
+    def load_elf(self, path, quiet=False):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
-            if self.model:
-                self.model.close()
-            self.model = ElfModel(path)
+            new_model = ElfModel(path)
+            old_model, self.model = self.model, new_model
+            if old_model:
+                old_model.close()
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
-            QtWidgets.QMessageBox.critical(self, "ELF error", str(e))
-            return
+            if not quiet:
+                QtWidgets.QMessageBox.critical(self, "ELF error", str(e))
+            self.statusBar().showMessage(f"Cannot read ELF: {e}")
+            return False
         QtWidgets.QApplication.restoreOverrideCursor()
         self.tree.clear()
         for n in self.model.roots:
             self.tree.addTopLevelItem(self._make_item(n))
+        self.apply_filter(self.edit_filter.text())
+        self.elf_path = path
+        self._elf_sig = self._stat_sig(path)
+        self._elf_pending = None
+        self.btn_reload.setText("Reload ELF")
+        self.lbl_elf.setStyleSheet("")
         self.lbl_elf.setText(path)
         note = "" if self.model.has_debug else "  (no DWARF info: raw symbols only, build with -g for types/structs)"
         self.statusBar().showMessage(f"{len(self.model.roots)} variables loaded{note}")
+        return True
+
+    # ---- ELF reload
+    @staticmethod
+    def _stat_sig(path):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def reload_elf(self, auto=False):
+        """Re-read the ELF and move the plotted variables to their new addresses."""
+        if not self.elf_path:
+            self.statusBar().showMessage("No ELF loaded yet.")
+            return
+        if not self.load_elf(self.elf_path, quiet=auto):
+            return
+        if not self.series:
+            return
+        moved, missing = self.remap_series()
+        msg = f"ELF reloaded ({len(self.model.roots)} variables): {len(self.series) - missing} plotted variable(s) updated"
+        if moved:
+            msg += f", {moved} moved to a new address"
+        if missing:
+            msg += f", {missing} not found (kept old address)"
+        self.statusBar().showMessage(msg)
+
+    def _check_elf(self):
+        """Called about once a second: notice a rebuilt ELF once the linker has finished writing it."""
+        if not self.elf_path:
+            return
+        sig = self._stat_sig(self.elf_path)
+        if sig is None or sig == self._elf_sig:
+            self._elf_pending = None
+            return
+        if self._elf_pending != sig:      # still changing: wait for the next check
+            self._elf_pending = sig
+            return
+        self._elf_pending = None
+        self._elf_sig = sig
+        if self.chk_auto_elf.isChecked():
+            self.reload_elf(auto=True)
+        else:
+            self.btn_reload.setText("Reload ELF ●")
+            self.lbl_elf.setStyleSheet("color: #ffb74d;")
+            self.statusBar().showMessage("The ELF file changed on disk - press Reload ELF.")
+
+    @staticmethod
+    def _find_node(root, path):
+        node = root
+        while node is not None and node.path != path:
+            nxt = None
+            for k in node.children():
+                if path == k.path or path.startswith(k.path + ".") or path.startswith(k.path + "["):
+                    nxt = k
+                    break
+            node = nxt
+        return node
+
+    def remap_series(self):
+        by_name = {}
+        for n in self.model.roots:
+            by_name.setdefault(n.label, []).append(n)
+        moved = missing = 0
+        for row, s in enumerate(self.series):
+            if s.name.startswith("mem_") and len(s.name) == 12:
+                continue                                   # added by address: nothing to look up
+            cut = len(s.name)
+            for ch in (".", "["):
+                i = s.name.find(ch)
+                if i != -1:
+                    cut = min(cut, i)
+            best = None
+            for root in by_name.get(s.name[:cut], []):     # same name can exist in several files
+                node = self._find_node(root, s.name)
+                if node is not None and node.leaf is not None:
+                    if best is None or abs(node.addr - s.addr) < abs(best.addr - s.addr):
+                        best = node
+            if best is None:
+                missing += 1
+                continue
+            with self.lock:
+                if best.addr != s.addr:
+                    moved += 1
+                s.addr = best.addr
+                s.enum = best.enum_map
+                if not s.type_overridden:
+                    s.size, s.fmt = best.leaf
+                    s.bits = best.bits
+            self._set_text(row, 2, f"0x{s.addr:08X}")
+            self.table.setCellWidget(row, 3, self._make_type_widget(s))
+            self.table.setCellWidget(row, 4, self._make_offset_widget(s))
+        return moved, missing
 
     def _make_item(self, node):
         size = f"{node.bits[1]} bit" if node.bits else str(node.size)
@@ -1268,15 +1386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         name.setForeground(QtGui.QBrush(QtGui.QColor(s.color)))
         self.table.setItem(r, 1, name)
         self.table.setItem(r, 2, W.QTableWidgetItem(f"0x{s.addr:08X}"))
-        if s.bits:
-            shift, width, signed = s.bits
-            self.table.setCellWidget(r, 3, W.QLabel(f" {'s' if signed else 'u'}{width} bit(s) @ bit {shift}"))
-        else:
-            combo = W.QComboBox()
-            combo.addItems(list(TYPES))
-            combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
-            combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
-            self.table.setCellWidget(r, 3, combo)
+        self.table.setCellWidget(r, 3, self._make_type_widget(s))
         self.table.setCellWidget(r, 4, self._make_offset_widget(s))
         self.table.setItem(r, 5, W.QTableWidgetItem("–"))
         for col in (6, 7, 8):
@@ -1284,6 +1394,17 @@ class MainWindow(QtWidgets.QMainWindow):
         btn = W.QPushButton("✕")
         btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
         self.table.setCellWidget(r, 9, btn)
+
+    def _make_type_widget(self, s):
+        W = QtWidgets
+        if s.bits:
+            shift, width, signed = s.bits
+            return W.QLabel(f" {'s' if signed else 'u'}{width} bit(s) @ bit {shift}")
+        combo = W.QComboBox()
+        combo.addItems(list(TYPES))
+        combo.setCurrentText(FMT_TO_TYPE.get((s.size, s.fmt), "uint32"))
+        combo.currentTextChanged.connect(lambda txt, s=s: self.set_type(s, txt))
+        return combo
 
     def _make_offset_widget(self, s):
         """Offset editor that matches the variable's type: integer spin box for integer
@@ -1325,6 +1446,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_type(self, s, tname):
         size, fmt = TYPES[tname]
+        s.type_overridden = True
         with self.lock:
             s.size, s.fmt = size, fmt
         s.t.clear()
@@ -1424,6 +1546,9 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setText("–" if v is None else f"{v:.6g}")
 
     def refresh(self):
+        self._tick += 1
+        if self._tick % 20 == 0:
+            self._check_elf()
         cur = self.btn_cursors.isChecked()
         x1, x2 = self.cursor1.value(), self.cursor2.value()
         for i, s in enumerate(self.series):
@@ -1467,11 +1592,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot.enableAutoRange(axis="y")
 
     def fit_view(self):
+        """Fit X: show the whole recorded time range and stop following."""
         self.btn_follow.setChecked(False)
         self.follow = False
-        self.plot.plotItem.vb.setAutoVisible(y=False)
-        self.plot.enableAutoRange()
-        self.plot.autoRange()
+        spans = [(s.t[0], s.t[-1]) for s in self.series if s.active and len(s.t)]
+        if spans:
+            lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
+            if hi <= lo:
+                hi = lo + 1.0
+            self.plot.setXRange(lo, hi, padding=0.02)
 
     def set_cursors(self, on):
         for c in (self.cursor1, self.cursor2):
