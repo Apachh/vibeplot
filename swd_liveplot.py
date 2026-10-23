@@ -965,26 +965,24 @@ class GraphTab(QtWidgets.QWidget):
         W = QtWidgets
         self.main = main
         self.series = []
-        self._enum_ticks = None
         self._loading = False
+        self.plots = []
+        self.cursors_on = False
+        self.following = True
+        self.plot_split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
 
-        self.plot = pg.PlotWidget()
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.plot.setLabel("bottom", "time", units="s")
-        self.plot.setClipToView(True)
-        self.plot.setDownsampling(mode="peak", auto=True)
-        self.plot.plotItem.vb.setAutoVisible(y=True)
-        self.legend = self.plot.addLegend()
-        self.table = W.QTableWidget(0, 10)
+        self.table = W.QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             ["Show", "Name", "Address", "Type", "Offset", "Value (dbl-click: write)", "@C1", "@C2",
-             "Δ (C2−C1)", ""])
+             "Δ (C2−C1)", "", "Graph"])
         self.table.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
-        for col, wd in ((0, 45), (2, 90), (3, 90), (4, 110), (5, 170), (6, 130), (7, 130), (8, 90), (9, 40)):
+        for col, wd in ((0, 45), (2, 90), (3, 90), (4, 110), (5, 170), (6, 130), (7, 130), (8, 90), (9, 40),
+                        (10, 90)):
             self.table.setColumnWidth(col, wd)
+        self.table.horizontalHeader().moveSection(10, 2)       # show "Graph" next to the name
         self.table.cellDoubleClicked.connect(lambda r, c: self.edit_value(r) if c == 5 else None)
         SC = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
         self.sc_del = SC(QtGui.QKeySequence("Delete"), self.table)
@@ -997,7 +995,20 @@ class GraphTab(QtWidgets.QWidget):
         btn_write = W.QPushButton("Write value…")
         btn_write.setToolTip("Write a new value into the selected variable's memory (needs Connect)")
         btn_write.clicked.connect(lambda: self.edit_value())
+        btn_add_graph = W.QPushButton("Add graph")
+        btn_add_graph.setToolTip("Add another graph below, sharing the time axis")
+        btn_add_graph.clicked.connect(lambda: self.add_plot())
+        btn_rm_graph = W.QPushButton("Remove graph")
+        btn_rm_graph.setToolTip("Remove the graph chosen on the right; its variables move to Graph 1")
+        btn_rm_graph.clicked.connect(self.remove_plot)
+        self.cmb_target = W.QComboBox()
+        self.cmb_target.setToolTip("Graph that receives newly added variables")
         rowb = W.QHBoxLayout()
+        rowb.addWidget(btn_add_graph)
+        rowb.addWidget(btn_rm_graph)
+        rowb.addWidget(W.QLabel("New variables go to"))
+        rowb.addWidget(self.cmb_target)
+        rowb.addSpacing(12)
         rowb.addWidget(btn_write)
         rowb.addWidget(btn_rm_sel)
         rowb.addWidget(btn_rm_all)
@@ -1035,24 +1046,108 @@ class GraphTab(QtWidgets.QWidget):
         tl.addWidget(self.table)
         self.on_selection()
 
-        # measurement cursors
-        self.cursor1 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#ffd54f", width=2),
-                                       label="C1 {value:0.3f}s",
-                                       labelOpts={"position": 0.95, "color": "#ffd54f"})
-        self.cursor2 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#4fc3f7", width=2),
-                                       label="C2 {value:0.3f}s",
-                                       labelOpts={"position": 0.88, "color": "#4fc3f7"})
-        for c in (self.cursor1, self.cursor2):
-            c.setVisible(False)
-            self.plot.addItem(c)
-
+        self.add_plot()
         split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
-        split.addWidget(self.plot)
+        split.addWidget(self.plot_split)
         split.addWidget(tbl_panel)
         split.setSizes([520, 280])
         lay = W.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(split)
+
+    # ---- graphs inside the tab
+    def add_plot(self):
+        pw = pg.PlotWidget()
+        pw.showGrid(x=True, y=True, alpha=0.3)
+        pw.setLabel("bottom", "time", units="s")
+        pw.setClipToView(True)
+        pw.setDownsampling(mode="peak", auto=True)
+        pw.plotItem.vb.setAutoVisible(y=self.following)
+        pw.legend = pw.addLegend()
+        pw.enum_ticks = None
+        pw.cursors = []
+        for label, color, pos in (("C1", "#ffd54f", 0.95), ("C2", "#4fc3f7", 0.88)):
+            c = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(color, width=2),
+                                label=label + " {value:0.3f}s", labelOpts={"position": pos, "color": color})
+            c.setVisible(self.cursors_on)
+            c.sigPositionChanged.connect(lambda line, pw=pw: self._sync_cursor(pw, line))
+            pw.addItem(c)
+            pw.cursors.append(c)
+        if self.plots:                                          # same cursor positions as the others
+            for c, o in zip(pw.cursors, self.plots[0].cursors):
+                c.setValue(o.value())
+        self.plots.append(pw)
+        self.plot_split.addWidget(pw)
+        self._relink()
+        self._plots_changed()
+        self.cmb_target.setCurrentIndex(len(self.plots) - 1)
+
+    def _sync_cursor(self, src, line):
+        i = src.cursors.index(line)
+        for pw in self.plots:
+            if pw is not src and pw.cursors[i].value() != line.value():
+                pw.cursors[i].setValue(line.value())
+
+    def _relink(self):
+        for i, pw in enumerate(self.plots):
+            pw.setXLink(self.plots[0] if i else None)
+            pw.getAxis("bottom").setStyle(showValues=True)
+
+    def _plots_changed(self):
+        names = [f"Graph {i + 1}" for i in range(len(self.plots))]
+        cur = self.cmb_target.currentIndex()
+        self.cmb_target.blockSignals(True)
+        self.cmb_target.clear()
+        self.cmb_target.addItems(names)
+        self.cmb_target.setCurrentIndex(min(max(cur, 0), len(names) - 1))
+        self.cmb_target.blockSignals(False)
+        for r, s in enumerate(self.series):
+            self.table.setCellWidget(r, 10, self._make_graph_widget(s))
+
+    def remove_plot(self):
+        if len(self.plots) <= 1:
+            self.main.statusBar().showMessage("Keep at least one graph in the tab.")
+            return
+        i = self.cmb_target.currentIndex()
+        pw = self.plots[i]
+        for s in self.series:
+            if s.plot is pw:
+                self.move_series(s, 0 if i else 1)
+        self.plots.pop(i)
+        for c in pw.cursors:
+            c.sigPositionChanged.disconnect()
+        pw.setXLink(None)
+        pw.setParent(None)
+        pw.deleteLater()
+        self._relink()
+        self._plots_changed()
+
+    def _make_graph_widget(self, s):
+        combo = QtWidgets.QComboBox()
+        combo.addItems([f"Graph {i + 1}" for i in range(len(self.plots))])
+        combo.setCurrentIndex(self.plots.index(s.plot))
+        combo.currentIndexChanged.connect(lambda i, s=s: self.move_series(s, i))
+        return combo
+
+    def move_series(self, s, i):
+        """Show the variable on graph number i (0-based)."""
+        if i < 0 or i >= len(self.plots) or self.plots[i] is s.plot:
+            if s in self.series:
+                self.table.setCellWidget(self.series.index(s), 10, self._make_graph_widget(s))
+            return
+        self._detach_curve(s)
+        s.plot = self.plots[i]
+        s.curve = s.plot.plot(pen=pg.mkPen(s.color, width=2), name=s.name)
+        s.curve.setVisible(s.active)
+        if s in self.series:
+            self.table.setCellWidget(self.series.index(s), 10, self._make_graph_widget(s))
+
+    def _detach_curve(self, s):
+        s.plot.removeItem(s.curve)
+        try:
+            s.plot.legend.removeItem(s.curve)
+        except Exception:
+            pass
 
     # ---- series management
     def add_series(self, name, addr, size, fmt, enum=None, bits=None):
@@ -1063,7 +1158,8 @@ class GraphTab(QtWidgets.QWidget):
         s = Series(sid, name, addr, size, fmt, color)
         s.enum = enum
         s.bits = bits
-        s.curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=name)
+        s.plot = self.plots[max(self.cmb_target.currentIndex(), 0)]
+        s.curve = s.plot.plot(pen=pg.mkPen(color, width=2), name=name)
         with self.main.lock:
             self.series.append(s)
         self._add_row(s)
@@ -1088,6 +1184,7 @@ class GraphTab(QtWidgets.QWidget):
         btn = W.QPushButton("✕")
         btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
         self.table.setCellWidget(r, 9, btn)
+        self.table.setCellWidget(r, 10, self._make_graph_widget(s))
 
     def _make_type_widget(self, s):
         W = QtWidgets
@@ -1155,11 +1252,7 @@ class GraphTab(QtWidgets.QWidget):
         with self.main.lock:
             self.series.pop(idx)
         self.table.removeRow(idx)
-        self.plot.removeItem(s.curve)
-        try:
-            self.legend.removeItem(s.curve)
-        except Exception:
-            pass
+        self._detach_curve(s)
 
     def remove_selected(self):
         rows = sorted({ix.row() for ix in self.table.selectedIndexes()}, reverse=True)
@@ -1228,8 +1321,12 @@ class GraphTab(QtWidgets.QWidget):
             item.setText(text)
 
     def _update_enum_axis(self):
-        """Label the Y axis with enum names when every visible variable is a plain enum."""
-        act = [s for s in self.series if s.active]
+        for pw in self.plots:
+            self._update_enum_axis_for(pw)
+
+    def _update_enum_axis_for(self, pw):
+        """Label the Y axis with enum names when every visible variable of the graph is a plain enum."""
+        act = [s for s in self.series if s.active and s.plot is pw]
         ok = bool(act) and all(s.enum_active() and s.mode == "None" and s.gain == 1.0 and s.offset == 0.0
                                for s in act)
         ticks = None
@@ -1239,10 +1336,10 @@ class GraphTab(QtWidgets.QWidget):
                 merged.update(s.enum)
             if len(merged) <= 64:
                 ticks = tuple(sorted(merged.items()))
-        if ticks == self._enum_ticks:
+        if ticks == pw.enum_ticks:
             return
-        self._enum_ticks = ticks
-        self.plot.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
+        pw.enum_ticks = ticks
+        pw.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
 
     def _set_cell(self, row, col, v):
         item = self.table.item(row, col)
@@ -1250,7 +1347,7 @@ class GraphTab(QtWidgets.QWidget):
             item.setText("–" if v is None else f"{v:.6g}")
 
     def refresh(self, cur, follow, window, t_last):
-        x1, x2 = self.cursor1.value(), self.cursor2.value()
+        x1, x2 = self.plots[0].cursors[0].value(), self.plots[0].cursors[1].value()
         for i, s in enumerate(self.series):
             n = len(s.t)
             ts = ys = raw = None
@@ -1279,14 +1376,17 @@ class GraphTab(QtWidgets.QWidget):
         if cur:
             dt = x2 - x1
             freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
-            self.plot.setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
+            for pw in self.plots:
+                pw.setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
         if follow and self.series:
-            self.plot.setXRange(max(0.0, t_last - window), max(t_last, 0.1), padding=0)
+            self.plots[0].setXRange(max(0.0, t_last - window), max(t_last, 0.1), padding=0)
 
     def set_follow(self, on):
-        self.plot.plotItem.vb.setAutoVisible(y=on)
-        if on:
-            self.plot.enableAutoRange(axis="y")
+        self.following = on
+        for pw in self.plots:
+            pw.plotItem.vb.setAutoVisible(y=on)
+            if on:
+                pw.enableAutoRange(axis="y")
 
     def fit_x(self):
         """Show the whole recorded time range."""
@@ -1295,21 +1395,25 @@ class GraphTab(QtWidgets.QWidget):
             lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
             if hi <= lo:
                 hi = lo + 1.0
-            self.plot.setXRange(lo, hi, padding=0.02)
+            self.plots[0].setXRange(lo, hi, padding=0.02)
 
     def fit_y(self):
-        self.plot.plotItem.vb.setAutoVisible(y=True)
-        self.plot.enableAutoRange(axis="y")
+        for pw in self.plots:
+            pw.plotItem.vb.setAutoVisible(y=True)
+            pw.enableAutoRange(axis="y")
 
     def set_cursors(self, on):
-        for c in (self.cursor1, self.cursor2):
-            c.setVisible(on)
+        self.cursors_on = on
+        for pw in self.plots:
+            for c in pw.cursors:
+                c.setVisible(on)
         if on:
-            (x0, x1), _ = self.plot.viewRange()
-            self.cursor1.setValue(x0 + 0.35 * (x1 - x0))
-            self.cursor2.setValue(x0 + 0.65 * (x1 - x0))
+            (x0, x1), _ = self.plots[0].viewRange()
+            self.plots[0].cursors[0].setValue(x0 + 0.35 * (x1 - x0))
+            self.plots[0].cursors[1].setValue(x0 + 0.65 * (x1 - x0))
         else:
-            self.plot.setTitle(None)
+            for pw in self.plots:
+                pw.setTitle(None)
             for i in range(len(self.series)):
                 for col in (6, 7, 8):
                     item = self.table.item(i, col)

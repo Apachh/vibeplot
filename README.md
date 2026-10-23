@@ -19,7 +19,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 
 - Load an `.elf` and browse its global and `static` variables, including C++ ones (namespaces, class static members, base classes).
 - Structs, unions, arrays, C++ base classes and bitfields expand in the tree, including **packed structs** (unaligned members are read safely, byte by byte). The tree shows each member's address, byte offset and bit range. Double-click a struct to add all of its members.
-- **Graph tabs**: each tab has its own plot, variable table and cursors. **Add selected** puts variables on the current tab; use **＋** for a new tab, double-click a tab to rename it, ✕ to close it. All tabs share one connection and one sampling loop.
+- **Graph tabs**: each tab has its own plot, variable table and cursors. **Add selected** puts variables on the current tab; use **＋** for a new tab, double-click a tab to rename it, ✕ to close it. All tabs share one connection and one sampling loop. Inside a tab, **Add graph** stacks more graphs that share the time axis and cursors; the **Graph** column of the variable table (or **New variables go to**) chooses which graph shows each variable, and **Remove graph** moves its variables to Graph 1.
 - Live graph with a rolling time window, **Follow live**, **Fit** (both axes) and **Fit Y** (vertical only).
 - Two measurement cursors with values at each cursor, Δ between them, Δt and frequency.
 - Post-processing per variable: moving average, moving RMS, median, low-pass (EMA), derivative, integral, absolute value, remove mean, plus gain and offset.
