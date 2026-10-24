@@ -32,6 +32,35 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 - **MCU register viewer** driven by a CMSIS-SVD file (peripherals, registers, bit fields, enum names), plus built-in Cortex-M core registers (SCB, SysTick, NVIC, DWT, CoreDebug) that work on any core. Plot or write registers and single fields.
 - Dark theme.
 
+## C++ / Qt 6 version
+
+The application has been rewritten in C++20 with Qt 6 (`src/`), with the same features and no Python at run time.
+The plot is a custom `QPainter` widget and DWARF is read with elfutils (`libdw`).
+
+```bash
+# Arch / Manjaro:  sudo pacman -S qt6-base elfutils cmake ninja
+# Debian / Ubuntu: sudo apt install qt6-base-dev libdw-dev libelf-dev cmake ninja-build
+cmake -S . -B build -G Ninja
+cmake --build build
+./build/swdplot [firmware.elf]
+ctest --test-dir build          # unit tests + an end-to-end GUI test against a fake OpenOCD
+```
+
+| File | Role |
+|---|---|
+| `src/DwarfNode.*`, `src/ElfModel.*` | variable tree from DWARF (structs, arrays, bitfields, C++ classes) or the symbol table |
+| `src/SvdRegs.*` | CMSIS-SVD parser and the built-in Cortex-M core registers |
+| `src/Poller.*` | OpenOCD Tcl thread: sampling, writes, register reads |
+| `src/Series.*`, `src/Processing.*` | one plotted variable and its filters |
+| `src/PlotWidget.*` | the plot (curves, cursors, enum axis, zoom/pan) |
+| `src/GraphTab.*` | one tab: graphs, variable table, post-processing panel |
+| `src/StreamFormat.*`, `src/StreamSink.*`, `src/StreamDialog.*` | live streaming to a pty / serial port / file |
+| `src/RegistersDialog.*` | register viewer |
+| `src/MainWindow.*`, `src/main.cpp`, `src/Theme.*` | application shell |
+
+Mouse in a graph: wheel zooms (Ctrl: time only, Shift: value only), left drag pans (or moves a cursor if you grab its line), right drag zooms.
+Settings (the SVD bound to each ELF) are stored in the same place as before, so they carry over from the Python version.
+
 ## Requirements
 
 - Python 3.9 or newer (recommended). On a fresh Debian/Ubuntu/Mint install: `sudo apt install python3 python3-venv python3-pip libxcb-cursor0` (the last package is needed by Qt's window plugin).
