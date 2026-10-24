@@ -28,6 +28,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 - **Stream** the plotted data live to a virtual COM port, a real serial port or a file (CSV, Teleplot or JSON lines), for comparison with another program.
 - Export recorded data to CSV (raw and processed).
 - Notices when the ELF is rebuilt and reloads it, keeping your plotted variables (matched by name) and moving them to their new addresses.
+- **MCU register viewer** driven by a CMSIS-SVD file (peripherals, registers, bit fields, enum names), plus built-in Cortex-M core registers (SCB, SysTick, NVIC, DWT, CoreDebug) that work on any core. Plot or write registers and single fields.
 - Dark theme.
 
 ## Requirements
@@ -97,6 +98,7 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 | Clear data | Delete the recorded samples, keep the variables |
 | Export CSV… | Save the recorded data (`variable, time_s, raw, processed`) |
 | Stream… | Open the live streaming settings |
+| Registers… | Open the MCU register viewer (see below) |
 
 ### Variable tree (left)
 
@@ -146,6 +148,23 @@ Be careful: this writes straight into the running target. If your firmware updat
 
 Variables of an enum type (including C++ `enum class`, and enum members of structs and arrays) display as `NAME (value)`. If all visible variables are plain enums, the Y axis is labeled with the names.
 
+### MCU register viewer (SVD)
+
+**Registers…** opens a separate window with the MCU's peripherals, registers and bit fields. It reads through the same OpenOCD connection as the plot, so press **Connect** first.
+
+1. Press **Load SVD…** and choose the CMSIS-SVD file of your MCU (the same file you give Cortex-Debug as `svdFile`; vendors and packs such as the CMSIS packs provide it). The file is remembered and **bound to the ELF** you have open, so it loads automatically next time.
+2. Expand a peripheral to read its registers, and expand a register to see its fields. Values are shown in hex; fields are decoded with their enum names. **Values that changed since the previous read are highlighted.** With **Auto-refresh** (default 500 ms) all expanded peripherals are re-read.
+3. Right-click for more: read now, plot a register or a single field (it then appears in the main graph like any other variable), write, copy address/value.
+4. Double-click a value to **write** it. A whole register is written as one value; a field is written with a read-modify-write that keeps the other bits. Both ask for confirmation, because they change the running hardware immediately.
+
+Built-in **Cortex-M core registers** are always listed (unless your SVD already defines the same base address): SCB (including the fault status registers CFSR, HFSR, and the fault addresses MMFAR and BFAR, decoded bit by bit), SysTick, NVIC (ISER/ICER/ISPR/ICPR/IABR), DWT and CoreDebug. Some of them do not exist on every core (for example CFSR on Cortex-M0); those simply read as 0.
+
+Safety rules built in:
+
+- Registers that the SVD marks with a **read action** (reading clears a flag or pops data, such as a UART data register), and SysTick CTRL / DHCSR, are **never read automatically**; use *Read now*. They cannot be plotted either, because continuous polling would change the hardware.
+- Write-only registers are not read, and read-only registers cannot be written.
+- A register that cannot be read (for example because the peripheral's clock is off) shows `<read error>` and does not stop the others.
+
 ### Streaming to another program
 
 **Stream…** sends the plotted values live while the app is connected.
@@ -192,6 +211,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 | Values wrong right after a rebuild | The ELF was reloaded but the target still runs the old firmware; flash and restart the debug session |
 | Read error with an OpenOCD message | OpenOCD older than 0.10, or the address is not readable memory |
 | Struct or class fields missing | Rebuild with `-g` (and a recent GCC); bitfields, base classes and anonymous unions are supported, virtual bases are not |
+| Registers show `<read error>` | The peripheral's clock is not enabled yet (enable it in RCC / the clock controller), or the SVD does not match the chip |
 | Variable missing from the list | Built without `-g`, optimized away, local variable, or clang DWARF 5 (see above) |
 | Values look wrong | Change the variable's **Type** in the table (size and signedness) |
 | Streaming to a COM port shows nothing | Reader must open the same path; on Windows use a com0com pair and the "Existing serial port" output |
@@ -201,5 +221,10 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 | File | Purpose |
 |---|---|
 | `swd_liveplot.py` | The application |
+| `svd_regs.py` | SVD parser and built-in Cortex-M core register definitions (must stay next to `swd_liveplot.py`) |
 | `run_swdplot.sh` | Launcher that sets up a virtual environment and starts the app |
 | `README.md` | This file |
+
+## License
+
+No license has been chosen yet. Add one before sharing the code publicly.

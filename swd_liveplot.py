@@ -14,6 +14,7 @@ Run:       python swd_liveplot.py [firmware.elf]
 """
 import csv
 import errno
+import hashlib
 import io
 import json
 import os
@@ -31,6 +32,8 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
+
+import svd_regs
 
 MAXPTS = 50000
 COLORS = ["#ff5555", "#55aaff", "#55dd77", "#ffaa33", "#cc77ff",
@@ -440,6 +443,7 @@ class ElfModel:
 class Poller(QtCore.QThread):
     sample = QtCore.Signal(float, object)
     status = QtCore.Signal(str)
+    regs_ready = QtCore.Signal(object, object)   # (token, {address: value or None})
 
     def __init__(self, host, port, get_specs, get_period):
         super().__init__()
@@ -448,21 +452,82 @@ class Poller(QtCore.QThread):
         self._stop = False
         self.sock = None
         self.writes = queue.Queue()
+        self.reads = queue.Queue()
         self.wake = threading.Event()
         self.wall0 = None
 
     def request_write(self, name, addr, raw):
         """Queue a memory write; it is executed by the polling thread between reads."""
-        self.writes.put((name, addr, raw))
+        self.writes.put(("w", name, addr, raw))
         self.wake.set()
+
+    def request_rmw(self, name, addr, size, mask, value):
+        """Queue a read-modify-write of `mask` bits (done back to back inside the polling thread)."""
+        self.writes.put(("rmw", name, addr, size, mask, value))
+        self.wake.set()
+
+    def request_read(self, token, specs):
+        """Queue a tolerant read of [(address, size_bytes)]; the result arrives via regs_ready."""
+        self.reads.put((token, specs))
+        self.wake.set()
+
+    def _read_int(self, addr, size):
+        w = pick_width(addr, size)
+        out = self.tcl(f"read_memory 0x{addr:x} {w * 8} {size // w}")
+        try:
+            words = [int(x, 0) for x in out.split()]
+        except ValueError:
+            raise ValueError(out[:150] or "empty reply")
+        if len(words) != size // w:
+            raise ValueError(f"bad reply: {out[:150]}")
+        return int.from_bytes(b"".join(struct.pack("<" + WIDTH[w], x) for x in words), "little")
+
+    def read_tolerant(self, specs):
+        """{address: int or None}. A failing address (for example a peripheral whose clock is
+        off) yields None instead of aborting the whole batch."""
+        res = {}
+        for i in range(0, len(specs), 100):
+            chunk = specs[i:i + 100]
+            parts = []
+            for addr, size in chunk:
+                w = pick_width(addr, size)
+                parts.append('if {[catch {read_memory 0x%x %d %d} r]} {append o ERR ";"} '
+                             'else {append o $r ";"}' % (addr, w * 8, size // w))
+            out = self.tcl('set o ""; ' + "; ".join(parts) + "; set o")
+            for (addr, size), ch in zip(chunk, out.split(";")):
+                w = pick_width(addr, size)
+                try:
+                    words = [int(x, 0) for x in ch.split()]
+                    if len(words) != size // w:
+                        raise ValueError
+                    res[addr] = int.from_bytes(b"".join(struct.pack("<" + WIDTH[w], x) for x in words), "little")
+                except ValueError:
+                    res[addr] = None
+        return res
+
+    def _do_reads(self):
+        while True:
+            try:
+                token, specs = self.reads.get_nowait()
+            except queue.Empty:
+                return
+            self.regs_ready.emit(token, self.read_tolerant(specs))
 
     def _do_writes(self):
         while True:
             try:
-                name, addr, raw = self.writes.get_nowait()
+                op = self.writes.get_nowait()
             except queue.Empty:
                 return
+            name, addr = op[1], op[2]
             try:
+                if op[0] == "rmw":
+                    _, _, _, size, mask, value = op
+                    cur = self._read_int(addr, size)
+                    new = ((cur & ~mask) | (value & mask)) & ((1 << (8 * size)) - 1)
+                    raw = new.to_bytes(size, "little")
+                else:
+                    raw = op[3]
                 out = self.tcl(build_write_cmd(addr, raw))
             except ValueError as e:
                 self.status.emit(f"Write {name} failed: {e}")
@@ -530,6 +595,7 @@ class Poller(QtCore.QThread):
             while not self._stop:
                 t_start = time.perf_counter()
                 self._do_writes()
+                self._do_reads()
                 specs = self.get_specs()
                 if specs:
                     vals = self.read_values(specs)
@@ -835,6 +901,7 @@ class Series:
         self.enum = None        # {value: name} when the variable is an enum
         self.bits = None        # (shift, width, signed) when the variable is a bitfield
         self.type_overridden = False   # user picked the type by hand: keep it on ELF reload
+        self.fixed = False             # registers / raw addresses: not looked up in the ELF
 
     def enum_active(self):
         return bool(self.enum) and self.fmt not in ("f", "d")
@@ -956,6 +1023,432 @@ class StreamDialog(QtWidgets.QDialog):
             self.lbl_status.setText(sink.describe() + hint)
 
 
+class RegistersDialog(QtWidgets.QDialog):
+    """MCU register viewer: peripherals from a CMSIS-SVD file plus built-in Cortex-M core registers.
+    Values are read through the same OpenOCD connection as the plot (Connect first)."""
+    ROLE = QtCore.Qt.ItemDataRole.UserRole
+
+    def __init__(self, main):
+        super().__init__(main)
+        W = QtWidgets
+        self.main = main
+        self.setWindowTitle("MCU registers")
+        self.resize(1000, 700)
+        self.svd_path = None
+        self.svd_info = {}
+        self.periphs = []
+        self.items = {}            # id(register) -> tree item
+        self.values = {}           # id(register) -> last value read
+        self._pending = False
+        self._pending_since = 0.0
+        self._initialised = False
+        self._elf_for = None
+        self._settings = QtCore.QSettings("swdplot", "swd_liveplot")
+
+        self.btn_load = W.QPushButton("Load SVD…")
+        self.btn_load.setToolTip("Choose the CMSIS-SVD file of your MCU (the one Cortex-Debug uses as svdFile)")
+        self.btn_load.clicked.connect(self.browse_svd)
+        self.btn_reload = W.QPushButton("Reload SVD")
+        self.btn_reload.clicked.connect(lambda: self.svd_path and self.open_svd(self.svd_path, remember=False))
+        self.lbl_svd = W.QLabel("")
+        self.lbl_svd.setWordWrap(True)
+        self.edit_filter = W.QLineEdit()
+        self.edit_filter.setPlaceholderText("Filter peripherals / registers…")
+        self.edit_filter.textChanged.connect(self.apply_filter)
+        self.btn_refresh = W.QPushButton("Refresh now")
+        self.btn_refresh.clicked.connect(lambda: self.refresh(force=True))
+        self.chk_auto = W.QCheckBox("Auto-refresh")
+        self.chk_auto.setChecked(True)
+        self.spin_ms = W.QSpinBox()
+        self.spin_ms.setRange(100, 10000)
+        self.spin_ms.setValue(500)
+        self.spin_ms.setSuffix(" ms")
+        self.spin_ms.setSingleStep(100)
+
+        self.tree = W.QTreeWidget()
+        self.tree.setHeaderLabels(["Name", "Address / bits", "Value", "Decoded", "Description"])
+        for col, wd in ((0, 230), (1, 110), (2, 130), (3, 150)):
+            self.tree.setColumnWidth(col, wd)
+        self.tree.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.on_menu)
+        self.tree.itemExpanded.connect(self.on_expand)
+        self.tree.itemDoubleClicked.connect(self.on_double)
+        self.lbl_status = W.QLabel("")
+        self.lbl_status.setWordWrap(True)
+
+        r1 = W.QHBoxLayout()
+        r1.addWidget(self.btn_load)
+        r1.addWidget(self.btn_reload)
+        r1.addWidget(self.lbl_svd, 1)
+        r2 = W.QHBoxLayout()
+        r2.addWidget(self.edit_filter, 1)
+        r2.addWidget(self.btn_refresh)
+        r2.addWidget(self.chk_auto)
+        r2.addWidget(self.spin_ms)
+        lay = W.QVBoxLayout(self)
+        lay.addLayout(r1)
+        lay.addLayout(r2)
+        lay.addWidget(self.tree, 1)
+        lay.addWidget(self.lbl_status)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(self.spin_ms.value())
+        self.spin_ms.valueChanged.connect(self.timer.setInterval)
+        self.set_status("Expand a peripheral to read its registers. Changed values are highlighted. "
+                        "Double-click a value to write; right-click for more.")
+
+    # ---- loading / binding
+    @staticmethod
+    def _key(path):
+        return hashlib.sha1(os.path.abspath(path).encode()).hexdigest()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._initialised:
+            self._initialised = True
+            self._autoload()
+
+    def on_elf_loaded(self, path):
+        """A different ELF was opened: switch to the SVD bound to it."""
+        if path != self._elf_for:
+            self._elf_for = path
+            if self._initialised:
+                self._autoload()
+
+    def _autoload(self):
+        self._elf_for = self.main.elf_path
+        path = None
+        if self.main.elf_path:
+            path = self._settings.value("svd_for/" + self._key(self.main.elf_path))
+        bound = bool(path)
+        if not path:
+            path = self._settings.value("svd/last")
+        if path and os.path.exists(str(path)):
+            if self.open_svd(str(path), remember=False, quiet=True):
+                if bound:
+                    self.lbl_svd.setText(self.lbl_svd.text() + "  (bound to this ELF)")
+                return
+        self.set_periphs([], {})
+
+    def browse_svd(self):
+        start = os.path.dirname(self.svd_path) if self.svd_path else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open SVD file", start, "SVD files (*.svd *.xml);;All files (*)")
+        if path:
+            self.open_svd(path)
+
+    def open_svd(self, path, remember=True, quiet=False):
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            info, periphs = svd_regs.load_svd(path)
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            if not quiet:
+                QtWidgets.QMessageBox.critical(self, "SVD error", f"Cannot read {path}:\n{e}")
+            self.set_status(f"Cannot read SVD: {e}")
+            return False
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.svd_path = path
+        self.set_periphs(periphs, info)
+        if remember:
+            self._settings.setValue("svd/last", path)
+            if self.main.elf_path:
+                self._settings.setValue("svd_for/" + self._key(self.main.elf_path), path)
+                self.lbl_svd.setText(self.lbl_svd.text() + "  (bound to this ELF)")
+        return True
+
+    def set_periphs(self, periphs, info):
+        bases = {p.base for p in periphs}
+        core = [p for p in svd_regs.core_peripherals() if p.base not in bases]
+        self.periphs = list(periphs) + core
+        self.svd_info = info
+        self.tree.clear()
+        self.items.clear()
+        self.values.clear()
+        for p in self.periphs:
+            self.tree.addTopLevelItem(self._periph_item(p))
+        self.apply_filter(self.edit_filter.text())
+        if periphs:
+            dev = info.get("device") or "SVD"
+            cpu = f", {info['cpu']}" if info.get("cpu") else ""
+            self.lbl_svd.setText(f"{dev}{cpu}: {len(periphs)} peripherals + {len(core)} Cortex-M core groups  -  {self.svd_path}")
+        else:
+            self.lbl_svd.setText("No SVD loaded: only the built-in Cortex-M core registers are shown. Press Load SVD…")
+
+    # ---- tree items
+    def _periph_item(self, p):
+        it = QtWidgets.QTreeWidgetItem([p.name, f"0x{p.base:08X}", "", "", p.desc])
+        it.setData(0, self.ROLE, p)
+        if p.regs:
+            it.addChild(QtWidgets.QTreeWidgetItem(["…"]))
+        return it
+
+    def _reg_item(self, r):
+        it = QtWidgets.QTreeWidgetItem([r.name, f"0x{r.addr:08X}", "", "", r.desc])
+        it.setData(0, self.ROLE, r)
+        self.items[id(r)] = it
+        if r.side_effect:
+            it.setText(2, "(read on request)")
+            it.setToolTip(2, "Reading this register has side effects (clears flags or pops data), so it is "
+                             "never read automatically. Right-click → Read now.")
+        elif not r.readable:
+            it.setText(2, "(write-only)")
+        if r.fields:
+            it.addChild(QtWidgets.QTreeWidgetItem(["…"]))
+        return it
+
+    def _field_item(self, f):
+        hi = f.off + f.width - 1
+        bits = f"[{hi}:{f.off}]" if f.width > 1 else f"[{f.off}]"
+        it = QtWidgets.QTreeWidgetItem([f.name, bits, "", "", f.desc])
+        it.setData(0, self.ROLE, f)
+        return it
+
+    def _has_placeholder(self, it):
+        return it.childCount() == 1 and it.child(0).data(0, self.ROLE) is None
+
+    def on_expand(self, it):
+        obj = it.data(0, self.ROLE)
+        if obj is None:
+            return
+        if self._has_placeholder(it):
+            it.takeChild(0)
+            if isinstance(obj, svd_regs.Peripheral):
+                for r in obj.regs:
+                    it.addChild(self._reg_item(r))
+                self.apply_filter(self.edit_filter.text())
+            elif isinstance(obj, svd_regs.Register):
+                for f in obj.fields:
+                    it.addChild(self._field_item(f))
+                v = self.values.get(id(obj))
+                if v is not None:
+                    self._show_value(obj, it, v, None)
+        if isinstance(obj, svd_regs.Peripheral):
+            self.refresh(force=True)
+
+    def apply_filter(self, text):
+        t = text.strip().lower()
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            p = top.data(0, self.ROLE)
+            p_hit = not t or t in p.name.lower() or t in p.desc.lower()
+            r_hit = p_hit or any(t in r.name.lower() for r in p.regs)
+            top.setHidden(not r_hit)
+            if not self._has_placeholder(top):
+                for j in range(top.childCount()):
+                    ch = top.child(j)
+                    r = ch.data(0, self.ROLE)
+                    ch.setHidden(bool(t) and not p_hit and t not in r.name.lower())
+
+    # ---- reading
+    def set_status(self, msg):
+        self.lbl_status.setText(msg)
+
+    def visible_regs(self):
+        regs = []
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            if top.isHidden() or not top.isExpanded() or self._has_placeholder(top):
+                continue
+            for j in range(top.childCount()):
+                ch = top.child(j)
+                r = ch.data(0, self.ROLE)
+                if isinstance(r, svd_regs.Register) and r.readable and not r.side_effect and not ch.isHidden():
+                    regs.append(r)
+        return regs
+
+    def refresh(self, regs=None, force=False):
+        poller = self.main.poller
+        if poller is None:
+            self.set_status("Not connected: press Connect in the main window first.")
+            return
+        if self._pending and not force and time.time() - self._pending_since < 3.0:
+            return
+        regs = self.visible_regs() if regs is None else regs
+        if not regs:
+            return
+        self._pending, self._pending_since = True, time.time()
+        poller.request_read(("regs", id(self), regs), [(r.addr, r.size // 8) for r in regs])
+
+    def _tick(self):
+        if self.isVisible() and self.chk_auto.isChecked() and self.main.poller is not None:
+            self.refresh()
+
+    def _refresh_soon(self, regs):
+        QtCore.QTimer.singleShot(100, lambda: self.refresh(regs, force=True))
+
+    def on_regs(self, token, res):
+        if not (isinstance(token, tuple) and len(token) == 3 and token[0] == "regs" and token[1] == id(self)):
+            return
+        self._pending = False
+        failed = 0
+        for r in token[2]:
+            it = self.items.get(id(r))
+            if it is None:
+                continue
+            v = res.get(r.addr)
+            if v is None:
+                failed += 1
+                it.setText(2, "<read error>")
+                self._color(it, 2, False)
+                continue
+            prev = self.values.get(id(r))
+            self.values[id(r)] = v
+            self._show_value(r, it, v, prev)
+        msg = f"Read {len(token[2])} register(s)"
+        if failed:
+            msg += f", {failed} could not be read (peripheral clock off, or reserved address)"
+        self.set_status(msg)
+
+    def _color(self, it, col, changed):
+        brush = QtGui.QBrush(QtGui.QColor("#ffb74d")) if changed else None
+        it.setData(col, QtCore.Qt.ItemDataRole.ForegroundRole, brush)
+
+    def _show_value(self, r, it, v, prev):
+        it.setText(2, f"0x{v:0{r.size // 4}X}")
+        self._color(it, 2, prev is not None and prev != v)
+        for i in range(it.childCount()):
+            ch = it.child(i)
+            f = ch.data(0, self.ROLE)
+            if not isinstance(f, svd_regs.Field):
+                continue
+            fv = f.extract(v)
+            ch.setText(2, str(fv) if f.width <= 4 else f"0x{fv:X}")
+            ch.setText(3, (f.enum.get(fv, "?") if f.enum else ""))
+            self._color(ch, 2, prev is not None and f.extract(prev) != fv)
+
+    # ---- actions
+    def _owner(self, it):
+        """(peripheral, register or None) for a tree item."""
+        obj = it.data(0, self.ROLE)
+        if isinstance(obj, svd_regs.Peripheral):
+            return obj, None
+        if isinstance(obj, svd_regs.Register):
+            return it.parent().data(0, self.ROLE), obj
+        return it.parent().parent().data(0, self.ROLE), it.parent().data(0, self.ROLE)
+
+    def on_double(self, it, col):
+        if col != 2:
+            return
+        obj = it.data(0, self.ROLE)
+        p, r = self._owner(it)
+        if isinstance(obj, svd_regs.Register):
+            self.write_register(p, obj)
+        elif isinstance(obj, svd_regs.Field):
+            self.write_field(p, r, obj)
+
+    def on_menu(self, pos):
+        it = self.tree.itemAt(pos)
+        if it is None:
+            return
+        obj = it.data(0, self.ROLE)
+        if obj is None:
+            return
+        p, r = self._owner(it)
+        menu = QtWidgets.QMenu(self)
+        acts = {}
+
+        def add(text, fn):
+            acts[menu.addAction(text)] = fn
+        if isinstance(obj, svd_regs.Peripheral):
+            add("Expand and read registers", lambda: it.setExpanded(True))
+        elif isinstance(obj, svd_regs.Register):
+            add("Read now", lambda: self.refresh([obj], force=True))
+            add("Plot register", lambda: self.plot(p, obj, None))
+            add("Write value…", lambda: self.write_register(p, obj))
+            add("Copy address", lambda: QtWidgets.QApplication.clipboard().setText(f"0x{obj.addr:08X}"))
+            add("Copy value", lambda: QtWidgets.QApplication.clipboard().setText(it.text(2)))
+        else:
+            add("Plot field", lambda: self.plot(p, r, obj))
+            add("Write field…", lambda: self.write_field(p, r, obj))
+            add("Copy value", lambda: QtWidgets.QApplication.clipboard().setText(it.text(2)))
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen in acts:
+            acts[chosen]()
+
+    def plot(self, p, r, f):
+        if r.side_effect:
+            QtWidgets.QMessageBox.information(
+                self, "Cannot plot", f"{p.name}.{r.name} has read side effects (reading changes the "
+                                     "hardware), so it is not polled continuously.")
+            return
+        if not r.readable:
+            QtWidgets.QMessageBox.information(self, "Cannot plot", "This register is write-only.")
+            return
+        if f is None:
+            self.main.add_register_series(f"{p.name}.{r.name}", r.addr, r.size // 8)
+        else:
+            self.main.add_register_series(f"{p.name}.{r.name}.{f.name}", r.addr, r.size // 8,
+                                          (f.off, f.width, False), f.enum)
+
+    def _confirm_write(self, what):
+        W = QtWidgets
+        ans = W.QMessageBox.question(self, "Write to hardware", f"{what}\n\nThis changes the running hardware immediately. Continue?")
+        return ans == W.QMessageBox.StandardButton.Yes
+
+    def write_register(self, p, r):
+        W = QtWidgets
+        poller = self.main.poller
+        if not r.writable:
+            W.QMessageBox.information(self, "Read-only", f"{p.name}.{r.name} is read-only.")
+            return
+        if poller is None:
+            W.QMessageBox.information(self, "Not connected", "Press Connect in the main window first.")
+            return
+        cur = self.values.get(id(r))
+        default = f"0x{cur:0{r.size // 4}X}" if cur is not None else "0x0"
+        text, ok = W.QInputDialog.getText(
+            self, f"Write {p.name}.{r.name}",
+            f"New value for the {r.size}-bit register at 0x{r.addr:08X} (decimal or 0x hex):", text=default)
+        if not ok or not text.strip():
+            return
+        try:
+            v = int(text.strip(), 0)
+            if not 0 <= v < (1 << r.size):
+                raise ValueError(f"must fit in {r.size} bits")
+        except ValueError as e:
+            W.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
+            return
+        if not self._confirm_write(f"Write 0x{v:X} to {p.name}.{r.name} (0x{r.addr:08X})?"):
+            return
+        poller.request_write(f"{p.name}.{r.name}", r.addr, v.to_bytes(r.size // 8, "little"))
+        self._refresh_soon([r])
+
+    def write_field(self, p, r, f):
+        W = QtWidgets
+        poller = self.main.poller
+        if not r.writable:
+            W.QMessageBox.information(self, "Read-only", f"{p.name}.{r.name} is read-only.")
+            return
+        if poller is None:
+            W.QMessageBox.information(self, "Not connected", "Press Connect in the main window first.")
+            return
+        title = f"Write {p.name}.{r.name}.{f.name}"
+        if f.enum:
+            items = [f"{nm} ({v})" for v, nm in sorted(f.enum.items())]
+            text, ok = W.QInputDialog.getItem(self, title, "Pick a value (or type a number):", items, 0, True)
+        else:
+            cur = self.values.get(id(r))
+            text, ok = W.QInputDialog.getText(
+                self, title, f"New value for the {f.width}-bit field (decimal or 0x hex):",
+                text=str(f.extract(cur)) if cur is not None else "0")
+        if not ok or not text.strip():
+            return
+        try:
+            v = parse_value(text, "I", f.enum)
+            if not 0 <= v <= f.mask:
+                raise ValueError(f"must fit in {f.width} bit(s)")
+        except ValueError as e:
+            W.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
+            return
+        if not self._confirm_write(f"Set {p.name}.{r.name}.{f.name} to {v}? The other bits of the register are kept."):
+            return
+        poller.request_rmw(f"{p.name}.{r.name}.{f.name}", r.addr, r.size // 8, f.mask << f.off, v << f.off)
+        self._refresh_soon([r])
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -972,6 +1465,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._elf_sig = None
         self._elf_pending = None
         self._tick = 0
+        self.reg_dlg = None
         self.stream_dlg = None
         self.sink = None
         self.stream_cfg = None
@@ -1035,6 +1529,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stream = W.QPushButton("Stream…")
         self.btn_stream.setToolTip("Send the plotted values live to a virtual COM port, serial port or file")
         self.btn_stream.clicked.connect(self.show_stream)
+        self.btn_regs = W.QPushButton("Registers…")
+        self.btn_regs.setToolTip("Browse the MCU's peripheral and Cortex-M core registers (SVD file)")
+        self.btn_regs.clicked.connect(self.show_registers)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_reload)
         top.addWidget(self.chk_auto_elf)
@@ -1054,6 +1551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.btn_clear)
         top.addWidget(self.btn_csv)
         top.addWidget(self.btn_stream)
+        top.addWidget(self.btn_regs)
 
         # left: variable tree
         left = W.QWidget()
@@ -1212,6 +1710,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_elf.setText(path)
         note = "" if self.model.has_debug else "  (no DWARF info: raw symbols only, build with -g for types/structs)"
         self.statusBar().showMessage(f"{len(self.model.roots)} variables loaded{note}")
+        if self.reg_dlg is not None:
+            self.reg_dlg.on_elf_loaded(path)
         return True
 
     # ---- ELF reload
@@ -1278,8 +1778,8 @@ class MainWindow(QtWidgets.QMainWindow):
             by_name.setdefault(n.label, []).append(n)
         moved = missing = 0
         for row, s in enumerate(self.series):
-            if s.name.startswith("mem_") and len(s.name) == 12:
-                continue                                   # added by address: nothing to look up
+            if s.fixed:
+                continue                                   # register / raw address: nothing to look up
             cut = len(s.name)
             for ch in (".", "["):
                 i = s.name.find(ch)
@@ -1359,15 +1859,16 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             QtWidgets.QMessageBox.warning(self, "Bad address", "Could not parse the address.")
             return
-        self.add_series(f"mem_{addr:08X}", addr, 4, "I")
+        self.add_series(f"mem_{addr:08X}", addr, 4, "I", fixed=True)
 
-    def add_series(self, name, addr, size, fmt, enum=None, bits=None):
+    def add_series(self, name, addr, size, fmt, enum=None, bits=None, fixed=False):
         if any(s.name == name and s.addr == addr for s in self.series):
             return
         color = COLORS[self.next_id % len(COLORS)]
         s = Series(self.next_id, name, addr, size, fmt, color)
         s.enum = enum
         s.bits = bits
+        s.fixed = fixed
         self.next_id += 1
         s.curve = self.plot.plot(pen=pg.mkPen(color, width=2), name=name)
         with self.lock:
@@ -1483,6 +1984,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poller = Poller(self.edit_host.text().strip() or "localhost", self.spin_port.value(),
                              self.get_specs, lambda: self.period)
         self.poller.sample.connect(self.on_sample)
+        self.poller.regs_ready.connect(self._on_regs_ready)
         self.poller.status.connect(self.statusBar().showMessage)
         self.poller.finished.connect(self.on_poller_finished)
         self.poller.start()
@@ -1627,6 +2129,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def remove_all_series(self):
         for s in list(self.series):
             self.remove_series(s)
+
+    # ---- registers
+    def show_registers(self):
+        if self.reg_dlg is None:
+            self.reg_dlg = RegistersDialog(self)
+        self.reg_dlg.show()
+        self.reg_dlg.raise_()
+        self.reg_dlg.activateWindow()
+
+    def _on_regs_ready(self, token, res):
+        if self.reg_dlg is not None:
+            self.reg_dlg.on_regs(token, res)
+
+    def add_register_series(self, name, addr, size, bits=None, enum=None):
+        if size not in UNSIGNED:
+            QtWidgets.QMessageBox.information(self, "Unsupported", f"{size * 8}-bit registers cannot be plotted.")
+            return
+        self.add_series(name, addr, size, UNSIGNED[size], enum, bits, fixed=True)
+        self.statusBar().showMessage(f"Added {name} to the plot")
 
     # ---- streaming
     def show_stream(self):
