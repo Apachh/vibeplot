@@ -33,6 +33,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
+import favorites
 import svd_regs
 
 MAXPTS = 50000
@@ -902,6 +903,7 @@ class Series:
         self.bits = None        # (shift, width, signed) when the variable is a bitfield
         self.type_overridden = False   # user picked the type by hand: keep it on ELF reload
         self.fixed = False             # registers / raw addresses: not looked up in the ELF
+        self.graph = 0                 # index of the graph (inside its tab) that shows it
 
     def enum_active(self):
         return bool(self.enum) and self.fmt not in ("f", "d")
@@ -1449,21 +1451,37 @@ class RegistersDialog(QtWidgets.QDialog):
         self._refresh_soon([r])
 
 
-class GraphTab(QtWidgets.QWidget):
-    """One graph: its own plot, cursors, variable table and post-processing panel.
-    Variables are chosen per tab; sampling and the OpenOCD connection are shared via `main`."""
+_UNSET = object()   # 'axis labels not applied yet' marker: forces the next refresh to set or clear them
 
-    def __init__(self, main):
+
+def process_series(s, ts, ys):
+    """raw -> filter/transform -> gain -> offset"""
+    y = apply_mode(s.mode, s.param, ts, ys)
+    if s.gain != 1.0 or s.offset != 0.0:
+        y = y * s.gain + s.offset
+    return y
+
+
+class GraphTab(QtWidgets.QWidget):
+    """One tab: its own graphs (stacked, sharing the time axis and the cursors), variable table and
+    post-processing panel. Sampling and the OpenOCD connection are shared through `main`."""
+
+    process = staticmethod(process_series)
+
+    def __init__(self, main, name):
         super().__init__()
         W = QtWidgets
         self.main = main
+        self.name = name
         self.series = []
-        self._loading = False
-        self.plots = []
-        self.cursors_on = False
+        self.plots, self.legends, self.cursors = [], [], []
+        self._enum_ticks = []
         self.following = True
-        self.plot_split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.cursors_on = False
+        self._syncing = False
+        self._loading = False
 
+        # ---- variable table
         self.table = W.QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             ["Show", "Name", "Address", "Type", "Offset", "Value (dbl-click: write)", "@C1", "@C2",
@@ -1479,6 +1497,7 @@ class GraphTab(QtWidgets.QWidget):
         self.table.cellDoubleClicked.connect(lambda r, c: self.edit_value(r) if c == 5 else None)
         SC = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
         self.sc_del = SC(QtGui.QKeySequence("Delete"), self.table)
+        self.sc_del.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)   # one Delete per tab
         self.sc_del.activated.connect(self.remove_selected)
 
         btn_rm_sel = W.QPushButton("Remove selected (Del)")
@@ -1488,27 +1507,29 @@ class GraphTab(QtWidgets.QWidget):
         btn_write = W.QPushButton("Write value…")
         btn_write.setToolTip("Write a new value into the selected variable's memory (needs Connect)")
         btn_write.clicked.connect(lambda: self.edit_value())
-        btn_add_graph = W.QPushButton("Add graph")
-        btn_add_graph.setToolTip("Add another graph below, sharing the time axis")
-        btn_add_graph.clicked.connect(lambda: self.add_plot())
-        btn_rm_graph = W.QPushButton("Remove graph")
-        btn_rm_graph.setToolTip("Remove the graph chosen on the right; its variables move to Graph 1")
-        btn_rm_graph.clicked.connect(self.remove_plot)
-        self.cmb_target = W.QComboBox()
-        self.cmb_target.setToolTip("Graph that receives newly added variables")
         rowb = W.QHBoxLayout()
-        rowb.addWidget(btn_add_graph)
-        rowb.addWidget(btn_rm_graph)
-        rowb.addWidget(W.QLabel("New variables go to"))
-        rowb.addWidget(self.cmb_target)
-        rowb.addSpacing(12)
         rowb.addWidget(btn_write)
         rowb.addWidget(btn_rm_sel)
         rowb.addWidget(btn_rm_all)
         rowb.addStretch(1)
-        tbl_panel = W.QWidget()
-        tl = W.QVBoxLayout(tbl_panel)
-        tl.setContentsMargins(0, 0, 0, 0)
+
+        # ---- graph controls
+        self.cmb_target = W.QComboBox()
+        self.cmb_target.setToolTip("Graph that receives newly added variables")
+        btn_add_graph = W.QPushButton("Add graph")
+        btn_add_graph.setToolTip("Add another graph below, sharing the time axis and cursors")
+        btn_add_graph.clicked.connect(lambda: self.add_plot())
+        btn_rm_graph = W.QPushButton("Remove graph")
+        btn_rm_graph.setToolTip("Remove the graph chosen on the left; its variables move to Graph 1")
+        btn_rm_graph.clicked.connect(lambda: self.remove_plot(self.cmb_target.currentIndex()))
+        rowg = W.QHBoxLayout()
+        rowg.addWidget(W.QLabel("New variables go to"))
+        rowg.addWidget(self.cmb_target)
+        rowg.addWidget(btn_add_graph)
+        rowg.addWidget(btn_rm_graph)
+        rowg.addStretch(1)
+
+        # ---- post-processing panel
         self.pp_box = W.QGroupBox("Post-processing of selected variable(s)  (click a row's name to select)")
         pl = W.QHBoxLayout(self.pp_box)
         self.lbl_sel = W.QLabel("")
@@ -1534,129 +1555,284 @@ class GraphTab(QtWidgets.QWidget):
         btn_pp_reset.clicked.connect(self.reset_pp)
         self.table.itemSelectionChanged.connect(self.on_selection)
 
+        tbl_panel = W.QWidget()
+        tl = W.QVBoxLayout(tbl_panel)
+        tl.setContentsMargins(0, 0, 0, 0)
         tl.addLayout(rowb)
+        tl.addLayout(rowg)
         tl.addWidget(self.pp_box)
         tl.addWidget(self.table)
         self.on_selection()
 
+        # ---- graphs (stacked, sharing the time axis)
+        self.plot_split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.add_plot()
-        split = W.QSplitter(QtCore.Qt.Orientation.Vertical)
-        split.addWidget(self.plot_split)
-        split.addWidget(tbl_panel)
-        split.setSizes([520, 280])
+
+        outer = W.QSplitter(QtCore.Qt.Orientation.Vertical)
+        outer.addWidget(self.plot_split)
+        outer.addWidget(tbl_panel)
+        outer.setSizes([520, 280])
         lay = W.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(split)
+        lay.addWidget(outer)
 
-    # ---- graphs inside the tab
+    # ---- graphs
     def add_plot(self):
-        pw = pg.PlotWidget()
-        pw.showGrid(x=True, y=True, alpha=0.3)
-        pw.setLabel("bottom", "time", units="s")
-        pw.setClipToView(True)
-        pw.setDownsampling(mode="peak", auto=True)
-        pw.plotItem.vb.setAutoVisible(y=self.following)
-        pw.legend = pw.addLegend()
-        pw.enum_ticks = None
-        pw.cursors = []
-        for label, color, pos in (("C1", "#ffd54f", 0.95), ("C2", "#4fc3f7", 0.88)):
-            c = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(color, width=2),
-                                label=label + " {value:0.3f}s", labelOpts={"position": pos, "color": color})
+        plot = pg.PlotWidget()
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.setLabel("bottom", "time", units="s")
+        plot.setLabel("left", f"Graph {len(self.plots) + 1}")
+        plot.setClipToView(True)
+        plot.setDownsampling(mode="peak", auto=True)
+        plot.plotItem.vb.setAutoVisible(y=self.following)
+        legend = plot.addLegend()
+        if self.plots:
+            plot.setXLink(self.plots[0])
+        c1 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#ffd54f", width=2), label="C1 {value:0.3f}s",
+                             labelOpts={"position": 0.95, "color": "#ffd54f"})
+        c2 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#4fc3f7", width=2), label="C2 {value:0.3f}s",
+                             labelOpts={"position": 0.88, "color": "#4fc3f7"})
+        if self.cursors:                                   # a new graph starts at the shared cursor positions
+            c1.setValue(self.cursors[0][0].value())
+            c2.setValue(self.cursors[0][1].value())
+        for c in (c1, c2):
             c.setVisible(self.cursors_on)
-            c.sigPositionChanged.connect(lambda line, pw=pw: self._sync_cursor(pw, line))
-            pw.addItem(c)
-            pw.cursors.append(c)
-        if self.plots:                                          # same cursor positions as the others
-            for c, o in zip(pw.cursors, self.plots[0].cursors):
-                c.setValue(o.value())
-        self.plots.append(pw)
-        self.plot_split.addWidget(pw)
-        self._relink()
-        self._plots_changed()
-        self.cmb_target.setCurrentIndex(len(self.plots) - 1)
+            plot.addItem(c)
+        c1.sigPositionChanged.connect(lambda ln: self._sync_cursor(0, ln))
+        c2.sigPositionChanged.connect(lambda ln: self._sync_cursor(1, ln))
+        self.plots.append(plot)
+        self.legends.append(legend)
+        self.cursors.append((c1, c2))
+        self._enum_ticks = [_UNSET] * len(self.plots)
+        self.plot_split.addWidget(plot)
+        self._refresh_graph_combos()
+        return len(self.plots) - 1
 
-    def _sync_cursor(self, src, line):
-        i = src.cursors.index(line)
-        for pw in self.plots:
-            if pw is not src and pw.cursors[i].value() != line.value():
-                pw.cursors[i].setValue(line.value())
+    def remove_plot(self, idx):
+        """Remove a graph; its variables move to Graph 1. Graph 1 itself cannot be removed."""
+        if idx <= 0 or idx >= len(self.plots):
+            self.main.statusBar().showMessage("Choose a graph other than Graph 1 to remove.")
+            return
+        for s in list(self.series):
+            if s.graph == idx:
+                self.set_graph(s, 0)
+        for s in self.series:
+            if s.graph > idx:
+                s.graph -= 1
+        plot = self.plots.pop(idx)
+        self.legends.pop(idx)
+        self.cursors.pop(idx)
+        plot.setParent(None)
+        plot.deleteLater()
+        self._enum_ticks = [_UNSET] * len(self.plots)
+        for i, p in enumerate(self.plots):
+            p.setLabel("left", f"Graph {i + 1}")
+        self._refresh_graph_combos()
 
-    def _relink(self):
-        for i, pw in enumerate(self.plots):
-            pw.setXLink(self.plots[0] if i else None)
-            pw.getAxis("bottom").setStyle(showValues=True)
-
-    def _plots_changed(self):
+    def _refresh_graph_combos(self):
         names = [f"Graph {i + 1}" for i in range(len(self.plots))]
-        cur = self.cmb_target.currentIndex()
+        keep = max(0, min(self.cmb_target.currentIndex(), len(names) - 1))
         self.cmb_target.blockSignals(True)
         self.cmb_target.clear()
         self.cmb_target.addItems(names)
-        self.cmb_target.setCurrentIndex(min(max(cur, 0), len(names) - 1))
+        self.cmb_target.setCurrentIndex(keep)
         self.cmb_target.blockSignals(False)
-        for r, s in enumerate(self.series):
-            self.table.setCellWidget(r, 10, self._make_graph_widget(s))
+        for row, s in enumerate(self.series):
+            combo = self.table.cellWidget(row, 10)
+            if combo is not None:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItems(names)
+                combo.setCurrentIndex(min(s.graph, len(names) - 1))
+                combo.blockSignals(False)
 
-    def remove_plot(self):
-        if len(self.plots) <= 1:
-            self.main.statusBar().showMessage("Keep at least one graph in the tab.")
-            return
-        i = self.cmb_target.currentIndex()
-        pw = self.plots[i]
-        for s in self.series:
-            if s.plot is pw:
-                self.move_series(s, 0 if i else 1)
-        self.plots.pop(i)
-        for c in pw.cursors:
-            c.sigPositionChanged.disconnect()
-        pw.setXLink(None)
-        pw.setParent(None)
-        pw.deleteLater()
-        self._relink()
-        self._plots_changed()
-
-    def _make_graph_widget(self, s):
-        combo = QtWidgets.QComboBox()
-        combo.addItems([f"Graph {i + 1}" for i in range(len(self.plots))])
-        combo.setCurrentIndex(self.plots.index(s.plot))
-        combo.currentIndexChanged.connect(lambda i, s=s: self.move_series(s, i))
-        return combo
-
-    def move_series(self, s, i):
-        """Show the variable on graph number i (0-based)."""
-        if i < 0 or i >= len(self.plots) or self.plots[i] is s.plot:
-            if s in self.series:
-                self.table.setCellWidget(self.series.index(s), 10, self._make_graph_widget(s))
+    def set_graph(self, s, idx):
+        if idx == s.graph or not 0 <= idx < len(self.plots):
             return
         self._detach_curve(s)
-        s.plot = self.plots[i]
-        s.curve = s.plot.plot(pen=pg.mkPen(s.color, width=2), name=s.name)
+        s.graph = idx
+        s.curve = self.plots[idx].plot(pen=pg.mkPen(s.color, width=2), name=s.name)
         s.curve.setVisible(s.active)
-        if s in self.series:
-            self.table.setCellWidget(self.series.index(s), 10, self._make_graph_widget(s))
+        self._enum_ticks = [_UNSET] * len(self.plots)
 
     def _detach_curve(self, s):
-        s.plot.removeItem(s.curve)
-        try:
-            s.plot.legend.removeItem(s.curve)
-        except Exception:
-            pass
+        for fn in (lambda: self.plots[s.graph].removeItem(s.curve), lambda: self.legends[s.graph].removeItem(s.curve)):
+            try:
+                fn()
+            except Exception:
+                pass
 
-    # ---- series management
+    def _sync_cursor(self, which, src):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            v = src.value()
+            for pair in self.cursors:
+                ln = pair[which]
+                if ln is not src and ln.value() != v:
+                    ln.setValue(v)
+        finally:
+            self._syncing = False
+
+    # ---- variables
     def add_series(self, name, addr, size, fmt, enum=None, bits=None, fixed=False):
         if any(s.name == name and s.addr == addr for s in self.series):
             return
-        sid = self.main.new_id()
+        sid = self.main.new_series_id()
         color = COLORS[sid % len(COLORS)]
         s = Series(sid, name, addr, size, fmt, color)
-        s.enum = enum
-        s.bits = bits
-        s.fixed = fixed
-        s.plot = self.plots[max(self.cmb_target.currentIndex(), 0)]
-        s.curve = s.plot.plot(pen=pg.mkPen(color, width=2), name=name)
+        s.enum, s.bits, s.fixed = enum, bits, fixed
+        s.graph = max(0, min(self.cmb_target.currentIndex(), len(self.plots) - 1))
+        s.curve = self.plots[s.graph].plot(pen=pg.mkPen(color, width=2), name=name)
         with self.main.lock:
             self.series.append(s)
         self._add_row(s)
+
+    def remove_series(self, s):
+        if s not in self.series:
+            return
+        idx = self.series.index(s)
+        with self.main.lock:
+            self.series.pop(idx)
+        self.table.removeRow(idx)
+        self._detach_curve(s)
+
+    def refresh_row(self, s):
+        """Show a variable's (possibly changed) address, type and offset editor again."""
+        if s in self.series:
+            row = self.series.index(s)
+            self._set_text(row, 2, f"0x{s.addr:08X}")
+            self.table.setCellWidget(row, 3, self._make_type_widget(s))
+            self.table.setCellWidget(row, 4, self._make_offset_widget(s))
+
+    def specs(self):
+        return [(s.id, s.addr, s.size, s.fmt, s.bits) for s in self.series if s.active]
+
+    def on_sample(self, t, values):
+        for s in self.series:
+            v = values.get(s.id)
+            if v is not None:
+                s.t.append(t)
+                s.y.append(v)
+                s.last = v
+
+    def clear_data(self):
+        for s in self.series:
+            s.t.clear()
+            s.y.clear()
+            s.last = None
+            s.curve.setData([], [])
+
+    def export_rows(self):
+        for s in self.series:
+            n = len(s.t)
+            if not n:
+                continue
+            ts = np.fromiter(s.t, float, n)
+            raw = np.fromiter(s.y, float, n)
+            proc = self.process(s, ts, raw)
+            for t, r, p in zip(ts, raw, proc):
+                yield [s.name, f"{t:.6f}", r, p]
+
+    # ---- display
+    def refresh_view(self, window, t_last):
+        cur = self.cursors_on
+        x1, x2 = self.cursors[0][0].value(), self.cursors[0][1].value()
+        for i, s in enumerate(self.series):
+            n = len(s.t)
+            ts = ys = raw = None
+            if n:
+                ts = np.fromiter(s.t, float, n)
+                raw = np.fromiter(s.y, float, n)
+                ys = self.process(s, ts, raw)
+                if s.active:
+                    s.curve.setData(ts, ys)
+            en = s.enum_active()
+            item = self.table.item(i, 5)
+            if item is not None and n:
+                item.setText(s.fmt_enum(raw[-1]) if en else f"{ys[-1]:.6g}")
+            if cur:
+                if en:
+                    a, b = self._step_at(ts, raw, x1), self._step_at(ts, raw, x2)
+                    self._set_text(i, 6, "–" if a is None else s.fmt_enum(a))
+                    self._set_text(i, 7, "–" if b is None else s.fmt_enum(b))
+                    self._set_text(i, 8, "" if a is None or b is None else ("changed" if a != b else "same"))
+                else:
+                    v1, v2 = self._at(ts, ys, x1), self._at(ts, ys, x2)
+                    self._set_cell(i, 6, v1)
+                    self._set_cell(i, 7, v2)
+                    self._set_cell(i, 8, v2 - v1 if v1 is not None and v2 is not None else None)
+        self._update_enum_axes()
+        if cur:
+            dt = x2 - x1
+            freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
+            self.plots[0].setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
+        if self.following and self.series:
+            self.plots[0].setXRange(max(0.0, t_last - window), max(t_last, 0.1), padding=0)
+
+    def _update_enum_axes(self):
+        """Label a graph's Y axis with enum names when every visible variable on it is a plain enum."""
+        for i, plot in enumerate(self.plots):
+            act = [s for s in self.series if s.active and s.graph == i]
+            ok = bool(act) and all(s.enum_active() and s.mode == "None" and s.gain == 1.0 and s.offset == 0.0
+                                   for s in act)
+            ticks = None
+            if ok:
+                merged = {}
+                for s in act:
+                    merged.update(s.enum)
+                if len(merged) <= 64:
+                    ticks = tuple(sorted(merged.items()))
+            if i < len(self._enum_ticks) and ticks == self._enum_ticks[i]:
+                continue
+            if i < len(self._enum_ticks):
+                self._enum_ticks[i] = ticks
+            plot.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
+
+    def set_follow(self, on):
+        self.following = on
+        for p in self.plots:
+            p.plotItem.vb.setAutoVisible(y=on)
+            if on:
+                p.enableAutoRange(axis="y")
+
+    def fit_view(self):
+        """Fit X: show the whole recorded time range and stop following."""
+        self.main.btn_follow.setChecked(False)
+        self.following = False
+        spans = [(s.t[0], s.t[-1]) for s in self.series if s.active and len(s.t)]
+        if spans:
+            lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
+            if hi <= lo:
+                hi = lo + 1.0
+            self.plots[0].setXRange(lo, hi, padding=0.02)
+
+    def fit_y(self):
+        for p in self.plots:
+            p.plotItem.vb.setAutoVisible(y=True)
+            p.enableAutoRange(axis="y")
+
+    def set_cursors(self, on):
+        self.cursors_on = on
+        for pair in self.cursors:
+            for c in pair:
+                c.setVisible(on)
+        if on:
+            self.main.btn_follow.setChecked(False)
+            (x0, x1), _ = self.plots[0].viewRange()
+            v1, v2 = x0 + 0.35 * (x1 - x0), x0 + 0.65 * (x1 - x0)
+            self.cursors[0][0].setValue(v1)
+            self.cursors[0][1].setValue(v2)
+        else:
+            self.plots[0].setTitle(None)
+            for i in range(len(self.series)):
+                for col in (6, 7, 8):
+                    item = self.table.item(i, col)
+                    if item is not None:
+                        item.setText("")
+
+    # ---- moved from the single-graph window: table rows, editors, post-processing, writing values
 
     def _add_row(self, s):
         W = QtWidgets
@@ -1678,7 +1854,12 @@ class GraphTab(QtWidgets.QWidget):
         btn = W.QPushButton("✕")
         btn.clicked.connect(lambda _checked=False, s=s: self.remove_series(s))
         self.table.setCellWidget(r, 9, btn)
-        self.table.setCellWidget(r, 10, self._make_graph_widget(s))
+        gcombo = W.QComboBox()
+        gcombo.addItems([f"Graph {i + 1}" for i in range(len(self.plots))])
+        gcombo.setCurrentIndex(min(s.graph, len(self.plots) - 1))
+        gcombo.setToolTip("Which graph of this tab shows the variable")
+        gcombo.currentIndexChanged.connect(lambda i, s=s: self.set_graph(s, i))
+        self.table.setCellWidget(r, 10, gcombo)
 
     def _make_type_widget(self, s):
         W = QtWidgets
@@ -1739,62 +1920,6 @@ class GraphTab(QtWidgets.QWidget):
         if s in self.series:
             self.table.setCellWidget(self.series.index(s), 4, self._make_offset_widget(s))
 
-    def remove_series(self, s):
-        if s not in self.series:
-            return
-        idx = self.series.index(s)
-        with self.main.lock:
-            self.series.pop(idx)
-        self.table.removeRow(idx)
-        self._detach_curve(s)
-
-    def remove_selected(self):
-        rows = sorted({ix.row() for ix in self.table.selectedIndexes()}, reverse=True)
-        for r in rows:
-            if r < len(self.series):
-                self.remove_series(self.series[r])
-
-    def remove_all_series(self):
-        for s in list(self.series):
-            self.remove_series(s)
-
-    def remap_series(self):
-        """After an ELF reload: look the variables up by name and move them to their new addresses."""
-        by_name = {}
-        for n in self.main.model.roots:
-            by_name.setdefault(n.label, []).append(n)
-        moved = missing = 0
-        for row, s in enumerate(self.series):
-            if s.fixed:
-                continue                                   # register / raw address: nothing to look up
-            cut = len(s.name)
-            for ch in (".", "["):
-                i = s.name.find(ch)
-                if i != -1:
-                    cut = min(cut, i)
-            best = None
-            for root in by_name.get(s.name[:cut], []):     # same name can exist in several files
-                node = MainWindow._find_node(root, s.name)
-                if node is not None and node.leaf is not None:
-                    if best is None or abs(node.addr - s.addr) < abs(best.addr - s.addr):
-                        best = node
-            if best is None:
-                missing += 1
-                continue
-            with self.main.lock:
-                if best.addr != s.addr:
-                    moved += 1
-                s.addr = best.addr
-                s.enum = best.enum_map
-                if not s.type_overridden:
-                    s.size, s.fmt = best.leaf
-                    s.bits = best.bits
-            self._set_text(row, 2, f"0x{s.addr:08X}")
-            self.table.setCellWidget(row, 3, self._make_type_widget(s))
-            self.table.setCellWidget(row, 4, self._make_offset_widget(s))
-        return moved, missing
-
-    # ---- display
     @staticmethod
     def _at(ts, ys, x):
         """Linear interpolation of a series at time x, or None if x is outside the data."""
@@ -1814,168 +1939,20 @@ class GraphTab(QtWidgets.QWidget):
         if item is not None:
             item.setText(text)
 
-    def _update_enum_axis(self):
-        for pw in self.plots:
-            self._update_enum_axis_for(pw)
-
-    def _update_enum_axis_for(self, pw):
-        """Label the Y axis with enum names when every visible variable of the graph is a plain enum."""
-        act = [s for s in self.series if s.active and s.plot is pw]
-        ok = bool(act) and all(s.enum_active() and s.mode == "None" and s.gain == 1.0 and s.offset == 0.0
-                               for s in act)
-        ticks = None
-        if ok:
-            merged = {}
-            for s in act:
-                merged.update(s.enum)
-            if len(merged) <= 64:
-                ticks = tuple(sorted(merged.items()))
-        if ticks == pw.enum_ticks:
-            return
-        pw.enum_ticks = ticks
-        pw.getAxis("left").setTicks(None if ticks is None else [[(float(v), nm) for v, nm in ticks]])
-
     def _set_cell(self, row, col, v):
         item = self.table.item(row, col)
         if item is not None:
             item.setText("–" if v is None else f"{v:.6g}")
 
-    def refresh(self, cur, follow, window, t_last):
-        x1, x2 = self.plots[0].cursors[0].value(), self.plots[0].cursors[1].value()
-        for i, s in enumerate(self.series):
-            n = len(s.t)
-            ts = ys = raw = None
-            if n:
-                ts = np.fromiter(s.t, float, n)
-                raw = np.fromiter(s.y, float, n)
-                ys = self.process(s, ts, raw)
-                if s.active:
-                    s.curve.setData(ts, ys)
-            en = s.enum_active()
-            item = self.table.item(i, 5)
-            if item is not None and n:
-                item.setText(s.fmt_enum(raw[-1]) if en else f"{ys[-1]:.6g}")
-            if cur:
-                if en:
-                    a, b = self._step_at(ts, raw, x1), self._step_at(ts, raw, x2)
-                    self._set_text(i, 6, "–" if a is None else s.fmt_enum(a))
-                    self._set_text(i, 7, "–" if b is None else s.fmt_enum(b))
-                    self._set_text(i, 8, "" if a is None or b is None else ("changed" if a != b else "same"))
-                else:
-                    v1, v2 = self._at(ts, ys, x1), self._at(ts, ys, x2)
-                    self._set_cell(i, 6, v1)
-                    self._set_cell(i, 7, v2)
-                    self._set_cell(i, 8, v2 - v1 if v1 is not None and v2 is not None else None)
-        self._update_enum_axis()
-        if cur:
-            dt = x2 - x1
-            freq = f"   ({1.0 / abs(dt):.4g} Hz)" if dt else ""
-            for pw in self.plots:
-                pw.setTitle(f"C1 = {x1:.4f} s    C2 = {x2:.4f} s    Δt = {dt:.4f} s{freq}", size="10pt")
-        if follow and self.series:
-            self.plots[0].setXRange(max(0.0, t_last - window), max(t_last, 0.1), padding=0)
+    def remove_selected(self):
+        rows = sorted({ix.row() for ix in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            if r < len(self.series):
+                self.remove_series(self.series[r])
 
-    def set_follow(self, on):
-        self.following = on
-        for pw in self.plots:
-            pw.plotItem.vb.setAutoVisible(y=on)
-            if on:
-                pw.enableAutoRange(axis="y")
-
-    def fit_x(self):
-        """Show the whole recorded time range."""
-        spans = [(s.t[0], s.t[-1]) for s in self.series if s.active and len(s.t)]
-        if spans:
-            lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
-            if hi <= lo:
-                hi = lo + 1.0
-            self.plots[0].setXRange(lo, hi, padding=0.02)
-
-    def fit_y(self):
-        for pw in self.plots:
-            pw.plotItem.vb.setAutoVisible(y=True)
-            pw.enableAutoRange(axis="y")
-
-    def set_cursors(self, on):
-        self.cursors_on = on
-        for pw in self.plots:
-            for c in pw.cursors:
-                c.setVisible(on)
-        if on:
-            (x0, x1), _ = self.plots[0].viewRange()
-            self.plots[0].cursors[0].setValue(x0 + 0.35 * (x1 - x0))
-            self.plots[0].cursors[1].setValue(x0 + 0.65 * (x1 - x0))
-        else:
-            for pw in self.plots:
-                pw.setTitle(None)
-            for i in range(len(self.series)):
-                for col in (6, 7, 8):
-                    item = self.table.item(i, col)
-                    if item is not None:
-                        item.setText("")
-
-    def clear_data(self):
-        for s in self.series:
-            s.t.clear()
-            s.y.clear()
-            s.last = None
-            s.curve.setData([], [])
-
-    # ---- writing values
-    def edit_value(self, row=None):
-        status = self.main.statusBar().showMessage
-        if row is None:
-            sel = self.selected_series()
-            if not sel:
-                status("Select a variable (click its name) to write a value.")
-                return
-            s = sel[0]
-        elif 0 <= row < len(self.series):
-            s = self.series[row]
-        else:
-            return
-        if s.bits:
-            QtWidgets.QMessageBox.information(
-                self, "Bitfield", "Bitfields are read-only: writing one would need a read-modify-write "
-                                  "that can race with the firmware.")
-            return
-        if self.main.poller is None:
-            QtWidgets.QMessageBox.information(self, "Not connected", "Press Connect first.")
-            return
-        cur = s.last
-        title = f"Write {s.name}"
-        if s.enum_active():
-            items = [f"{nm} ({v})" for v, nm in sorted(s.enum.items())]
-            idx = 0
-            if cur is not None:
-                label = s.fmt_enum(cur)
-                idx = items.index(label) if label in items else 0
-            text, ok = QtWidgets.QInputDialog.getItem(
-                self, title, "Pick an enum value (or type a number):", items, idx, True)
-        else:
-            default = "" if cur is None else (f"{cur:.9g}" if s.fmt in ("f", "d") else str(int(cur)))
-            text, ok = QtWidgets.QInputDialog.getText(
-                self, title, f"New value ({FMT_TO_TYPE.get((s.size, s.fmt), '?')}, "
-                             "decimal or 0x hex; written raw, ignores gain/offset):",
-                text=default)
-        if not ok or not text.strip():
-            return
-        try:
-            value = parse_value(text, s.fmt, s.enum if s.enum_active() else None)
-            raw = struct.pack("<" + s.fmt, value)
-        except (ValueError, struct.error, OverflowError) as e:
-            QtWidgets.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
-            return
-        self.main.poller.request_write(s.name, s.addr, raw)
-
-    # ---- post-processing
-    @staticmethod
-    def process(s, ts, ys):
-        """raw -> filter/transform -> gain -> offset"""
-        y = apply_mode(s.mode, s.param, ts, ys)
-        if s.gain != 1.0 or s.offset != 0.0:
-            y = y * s.gain + s.offset
-        return y
+    def remove_all_series(self):
+        for s in list(self.series):
+            self.remove_series(s)
 
     def selected_series(self):
         rows = sorted({ix.row() for ix in self.table.selectedIndexes()})
@@ -2032,22 +2009,70 @@ class GraphTab(QtWidgets.QWidget):
                 sp.setValue(0)
         self.on_selection()
 
+    def edit_value(self, row=None):
+        if row is None:
+            sel = self.selected_series()
+            if not sel:
+                self.main.statusBar().showMessage("Select a variable (click its name) to write a value.")
+                return
+            s = sel[0]
+        elif 0 <= row < len(self.series):
+            s = self.series[row]
+        else:
+            return
+        if s.bits:
+            QtWidgets.QMessageBox.information(
+                self, "Bitfield", "Bitfields are read-only: writing one would need a read-modify-write "
+                                  "that can race with the firmware.")
+            return
+        if self.main.poller is None:
+            QtWidgets.QMessageBox.information(self, "Not connected", "Press Connect first.")
+            return
+        cur = s.last
+        title = f"Write {s.name}"
+        if s.enum_active():
+            items = [f"{nm} ({v})" for v, nm in sorted(s.enum.items())]
+            idx = 0
+            if cur is not None:
+                label = s.fmt_enum(cur)
+                idx = items.index(label) if label in items else 0
+            text, ok = QtWidgets.QInputDialog.getItem(
+                self, title, "Pick an enum value (or type a number):", items, idx, True)
+        else:
+            default = "" if cur is None else (f"{cur:.9g}" if s.fmt in ("f", "d") else str(int(cur)))
+            text, ok = QtWidgets.QInputDialog.getText(
+                self, title, f"New value ({FMT_TO_TYPE.get((s.size, s.fmt), '?')}, "
+                             "decimal or 0x hex; written raw, ignores gain/offset):",
+                text=default)
+        if not ok or not text.strip():
+            return
+        try:
+            value = parse_value(text, s.fmt, s.enum if s.enum_active() else None)
+            raw = struct.pack("<" + s.fmt, value)
+        except (ValueError, struct.error, OverflowError) as e:
+            QtWidgets.QMessageBox.warning(self, "Invalid value", f"Cannot write '{text}': {e}")
+            return
+        self.main.poller.request_write(s.name, s.addr, raw)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SWD Live Plot")
         self.model = None
+        self.tab_list = []             # GraphTab objects (the polling thread reads it under self.lock)
+        self._tab_counter = 1
         self.lock = threading.Lock()
         self.poller = None
         self.next_id = 0
-        self._tab_no = 0
         self.t_last = 0.0
-        self.follow = True
         self.elf_path = None
         self._elf_sig = None
         self._elf_pending = None
         self._tick = 0
+        self.settings = QtCore.QSettings("swdplot", "swd_liveplot")
+        self._fav_set = set()          # paths of favorite variables (for the ★ marks)
+        self._roots_by_name = {}       # name -> root nodes of the loaded ELF
         self.reg_dlg = None
         self.stream_dlg = None
         self.sink = None
@@ -2152,33 +2177,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setSelectionMode(W.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemExpanded.connect(self.on_expand)
         self.tree.itemDoubleClicked.connect(lambda it, _c: self.add_items([it]))
-        btn_add = W.QPushButton("Add selected to current tab ▶")
+        btn_add = W.QPushButton("Add selected to plot ▶")
         btn_add.clicked.connect(lambda: self.add_items(self.tree.selectedItems()))
         btn_addr = W.QPushButton("Add by address…")
         btn_addr.clicked.connect(self.add_by_address)
+        btn_fav = W.QPushButton("★ Favorite")
+        btn_fav.setToolTip("Add the selected variables to a favorites group (or right-click a variable)")
+        self.menu_fav = W.QMenu(btn_fav)
+        self.menu_fav.aboutToShow.connect(self._on_fav_menu_show)
+        btn_fav.setMenu(self.menu_fav)
+        self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.on_tree_menu)
         row = W.QHBoxLayout()
         row.addWidget(btn_add)
+        row.addWidget(btn_fav)
         row.addWidget(btn_addr)
         ll.addWidget(self.edit_filter)
         ll.addWidget(self.tree, 1)
         ll.addLayout(row)
 
-        # right: tabs, each with its own plot and variable table
+        self.fav = favorites.FavoritesPanel(self._fav_resolve, self._fav_add_to_plot, self.settings)
+        self.fav.changed.connect(self.refresh_stars)
+        self.left_tabs = W.QTabWidget()
+        self.left_tabs.addTab(left, "Variables")
+        self.left_tabs.addTab(self.fav, "★ Favorites")
+
+        # right: graph tabs (each tab has its own graphs, variable table and cursors)
         self.tabs = W.QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.tabBar().tabBarDoubleClicked.connect(self.rename_tab)
-        self.tabs.tabBar().setToolTip("Double-click a tab to rename it")
+        self.tabs.setDocumentMode(True)
         btn_new_tab = W.QToolButton()
         btn_new_tab.setText("＋")
-        btn_new_tab.setToolTip("New graph tab")
+        btn_new_tab.setToolTip("New graph tab (its own graphs, variables and cursors)")
         btn_new_tab.clicked.connect(lambda: self.add_tab())
         self.tabs.setCornerWidget(btn_new_tab, QtCore.Qt.Corner.TopRightCorner)
-        self.add_tab()
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         split = W.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        split.addWidget(left)
+        split.addWidget(self.left_tabs)
         split.addWidget(self.tabs)
         split.setSizes([420, 980])
 
@@ -2187,14 +2226,27 @@ class MainWindow(QtWidgets.QMainWindow):
         cl.addLayout(top)
         cl.addWidget(split, 1)
         self.setCentralWidget(central)
+        self.add_tab()
         self.statusBar().showMessage("Open an ELF, add variables, start debugging in VS Code, then Connect.")
 
     # ---- ELF / tree
     def open_elf(self):
+        last = str(self.settings.value("elf/last") or "")
+        start = os.path.dirname(last) if last else ""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open firmware ELF", "", "ELF files (*.elf *.axf *.out);;All files (*)")
+            self, "Open firmware ELF", start, "ELF files (*.elf *.axf *.out);;All files (*)")
         if path:
             self.load_elf(path)
+
+    def restore_last_elf(self):
+        """Reopen the ELF that was loaded when the app was closed."""
+        last = str(self.settings.value("elf/last") or "")
+        if not last:
+            return
+        if os.path.exists(last):
+            self.load_elf(last, quiet=True)
+        else:
+            self.statusBar().showMessage(f"The last ELF no longer exists: {last}")
 
     def load_elf(self, path, quiet=False):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
@@ -2210,6 +2262,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Cannot read ELF: {e}")
             return False
         QtWidgets.QApplication.restoreOverrideCursor()
+        self._roots_by_name = {}
+        for n in self.model.roots:
+            self._roots_by_name.setdefault(n.label, []).append(n)
+        self.settings.setValue("elf/last", path)          # restored on the next start
+        self.settings.sync()
+        self.fav.set_scope(path)                          # favorites of this ELF (updates the ★ set)
         self.tree.clear()
         for n in self.model.roots:
             self.tree.addTopLevelItem(self._make_item(n))
@@ -2242,15 +2300,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.load_elf(self.elf_path, quiet=auto):
             return
-        total = len(self.series)
-        if not total:
+        if not self.all_series():
             return
-        moved = missing = 0
-        for tab in self.all_tabs():
-            m, x = tab.remap_series()
-            moved += m
-            missing += x
-        msg = f"ELF reloaded ({len(self.model.roots)} variables): {total - missing} plotted variable(s) updated"
+        moved, missing = self.remap_series()
+        msg = f"ELF reloaded ({len(self.model.roots)} variables): {len(self.all_series()) - missing} plotted variable(s) updated"
         if moved:
             msg += f", {moved} moved to a new address"
         if missing:
@@ -2289,7 +2342,6 @@ class MainWindow(QtWidgets.QMainWindow):
             node = nxt
         return node
 
-
     def _make_item(self, node):
         size = f"{node.bits[1]} bit" if node.bits else str(node.size)
         if node.rel is None:
@@ -2298,11 +2350,102 @@ class MainWindow(QtWidgets.QMainWindow):
             layout = f"+0x{node.rel:X}  bits {node.bits[0]}..{node.bits[0] + node.bits[1] - 1}"
         else:
             layout = f"+0x{node.rel:X}"
-        it = QtWidgets.QTreeWidgetItem([node.label, f"0x{node.addr:08X}", size, node.typename, layout])
+        star = "★ " if node.path in self._fav_set else ""
+        it = QtWidgets.QTreeWidgetItem([star + node.label, f"0x{node.addr:08X}", size, node.typename, layout])
         it.setData(0, QtCore.Qt.ItemDataRole.UserRole, node)
         if node.expandable:
             it.addChild(QtWidgets.QTreeWidgetItem(["…"]))  # placeholder, replaced on expand
         return it
+
+    # ---- favorites
+    def find_variable(self, path):
+        """Node of the variable with this path ('motor.cur', 'table[2].g') in the loaded ELF, or None."""
+        if self.model is None:
+            return None
+        cut = len(path)
+        for ch in (".", "["):
+            i = path.find(ch)
+            if i != -1:
+                cut = min(cut, i)
+        for root in self._roots_by_name.get(path[:cut], []):
+            node = self._find_node(root, path)
+            if node is not None:
+                return node
+        return None
+
+    def _fav_resolve(self, path):
+        n = self.find_variable(path)
+        return None if n is None else (n.addr, n.typename)
+
+    def _fav_add_to_plot(self, paths):
+        added = missing = 0
+        for path in paths:
+            node = self.find_variable(path)
+            if node is None:
+                missing += 1
+                continue
+            leaves = []
+            collect_leaves(node, leaves)
+            for n in leaves:
+                self.add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
+                added += 1
+        msg = f"{added} variable(s) added to the plot"
+        if missing:
+            msg += f", {missing} favorite(s) not found in this ELF"
+        self.statusBar().showMessage(msg)
+
+    def refresh_stars(self):
+        """Put a ★ in front of favorite variables in the variable tree."""
+        self._fav_set = self.fav.all_paths()
+
+        def walk(item):
+            node = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if node is not None:
+                item.setText(0, ("★ " if node.path in self._fav_set else "") + node.label)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+        for i in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(i))
+
+    def _tree_selected_paths(self):
+        out = []
+        for it in self.tree.selectedItems():
+            node = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if node is not None and node.path not in out:
+                out.append(node.path)
+        return out
+
+    def _fill_fav_menu(self, menu, paths):
+        if not paths:
+            menu.addAction("Select variables in the list first").setEnabled(False)
+            return
+        for g in self.fav.groups():
+            menu.addAction(f"Add to “{g}”").triggered.connect(
+                lambda _checked=False, g=g: self.fav.add(paths, g))
+        menu.addAction("Add to new group…").triggered.connect(
+            lambda _checked=False: self.fav.add_to_new_group(paths))
+        if any(p in self._fav_set for p in paths):
+            menu.addSeparator()
+            menu.addAction("Remove from favorites").triggered.connect(
+                lambda _checked=False: self.fav.remove_paths(paths))
+
+    def _on_fav_menu_show(self):
+        self.menu_fav.clear()
+        self._fill_fav_menu(self.menu_fav, self._tree_selected_paths())
+
+    def on_tree_menu(self, pos):
+        it = self.tree.itemAt(pos)
+        if it is None or it.data(0, QtCore.Qt.ItemDataRole.UserRole) is None:
+            return
+        if not it.isSelected():
+            self.tree.clearSelection()
+            it.setSelected(True)
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Add to plot").triggered.connect(
+            lambda _checked=False: self.add_items(self.tree.selectedItems()))
+        menu.addSeparator()
+        self._fill_fav_menu(menu, self._tree_selected_paths())
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def on_expand(self, it):
         node = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
@@ -2331,7 +2474,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Select a scalar variable (or a struct/array to add its members).")
             return
         for n in leaves:
-            self.current_tab().add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
+            self.add_series(n.path, n.addr, n.leaf[0], n.leaf[1], n.enum_map, n.bits)
 
     def add_by_address(self):
         text, ok = QtWidgets.QInputDialog.getText(self, "Add by address", "Hex address (e.g. 0x20000010):")
@@ -2342,11 +2485,161 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             QtWidgets.QMessageBox.warning(self, "Bad address", "Could not parse the address.")
             return
-        self.current_tab().add_series(f"mem_{addr:08X}", addr, 4, "I", fixed=True)
+        self.add_series(f"mem_{addr:08X}", addr, 4, "I", fixed=True)
+
+    # ---- graph tabs
+    def new_series_id(self):
+        self.next_id += 1
+        return self.next_id - 1
+
+    def current_tab(self):
+        return self.tabs.currentWidget()
+
+    def all_series(self):
+        return [s for t in self.tab_list for s in t.series]
+
+    def add_tab(self, name=None):
+        name = name or f"Tab {self._tab_counter}"
+        self._tab_counter += 1
+        tab = GraphTab(self, name)
+        with self.lock:
+            self.tab_list.append(tab)
+        self.tabs.setCurrentIndex(self.tabs.addTab(tab, name))
+        return tab
+
+    def close_tab(self, index):
+        tab = self.tabs.widget(index)
+        if tab is None:
+            return
+        n = len(tab.series)
+        if n:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Close tab", f"Close “{tab.name}” and remove its {n} variable(s) from the plot?")
+            if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        with self.lock:
+            self.tab_list.remove(tab)
+        self.tabs.removeTab(index)
+        tab.deleteLater()
+        if not self.tab_list:
+            self.add_tab()
+
+    def rename_tab(self, index):
+        tab = self.tabs.widget(index) if index >= 0 else None
+        if tab is None:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename tab", "Tab name:", text=tab.name)
+        name = name.strip()
+        if ok and name:
+            tab.name = name
+            self.tabs.setTabText(index, name)
+
+    def _on_tab_changed(self, index):
+        tab = self.tabs.widget(index) if index >= 0 else None
+        if tab is None:
+            return
+        for btn, val in ((self.btn_follow, tab.following), (self.btn_cursors, tab.cursors_on)):
+            btn.blockSignals(True)       # show this tab's state without triggering the toggle handlers
+            btn.setChecked(val)
+            btn.blockSignals(False)
+        tab.refresh_view(self.spin_window.value(), self.t_last)
+
+    def add_series(self, name, addr, size, fmt, enum=None, bits=None, fixed=False):
+        """Add a variable to the current tab."""
+        tab = self.current_tab()
+        if tab is not None:
+            tab.add_series(name, addr, size, fmt, enum, bits, fixed)
+
+    # the top-bar buttons act on the current tab
+    def set_follow(self, on):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.set_follow(on)
+
+    def fit_view(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.fit_view()
+
+    def fit_y(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.fit_y()
+
+    def set_cursors(self, on):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.set_cursors(on)
+
+    def clear_data(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.clear_data()
 
     def get_specs(self):
         with self.lock:
-            return [(s.id, s.addr, s.size, s.fmt, s.bits) for s in self.series if s.active]
+            return [spec for t in self.tab_list for spec in t.specs()]
+
+    def on_sample(self, t, values):
+        self.t_last = t
+        for tab in self.tab_list:
+            tab.on_sample(t, values)
+        self.stream_sample(t, values)
+
+    def refresh(self):
+        self._tick += 1
+        if self._tick % 20 == 0:
+            self._check_elf()
+        tab = self.current_tab()
+        if tab is not None:
+            tab.refresh_view(self.spin_window.value(), self.t_last)
+        self._update_stream_ui()
+
+    def remap_series(self):
+        by_name = {}
+        for n in self.model.roots:
+            by_name.setdefault(n.label, []).append(n)
+        moved = missing = 0
+        for tab in self.tab_list:
+            for s in list(tab.series):
+                if s.fixed:
+                    continue                                   # register / raw address: nothing to look up
+                cut = len(s.name)
+                for ch in (".", "["):
+                    i = s.name.find(ch)
+                    if i != -1:
+                        cut = min(cut, i)
+                best = None
+                for root in by_name.get(s.name[:cut], []):     # same name can exist in several files
+                    node = self._find_node(root, s.name)
+                    if node is not None and node.leaf is not None:
+                        if best is None or abs(node.addr - s.addr) < abs(best.addr - s.addr):
+                            best = node
+                if best is None:
+                    missing += 1
+                    continue
+                with self.lock:
+                    if best.addr != s.addr:
+                        moved += 1
+                    s.addr = best.addr
+                    s.enum = best.enum_map
+                    if not s.type_overridden:
+                        s.size, s.fmt = best.leaf
+                        s.bits = best.bits
+                tab.refresh_row(s)
+        return moved, missing
+
+    def export_csv(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV", "samples.csv", "CSV (*.csv)")
+        if not path:
+            return
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["variable", "time_s", "raw", "processed", "tab"])
+            for tab in self.tab_list:
+                for row in tab.export_rows():
+                    w.writerow(row + [tab.name])
+        self.statusBar().showMessage(f"Saved {path}")
 
     # ---- connection
     def toggle_connect(self):
@@ -2371,92 +2664,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.poller = None
             self.btn_conn.setText("Connect")
 
-    def on_sample(self, t, values):
-        self.t_last = t
-        for s in self.series:
-            v = values.get(s.id)
-            if v is not None:
-                s.t.append(t)
-                s.y.append(v)
-                s.last = v
-        self.stream_sample(t, values)
-
-    # ---- tabs
-    def new_id(self):
-        self.next_id += 1
-        return self.next_id - 1
-
-    @property
-    def series(self):
-        return [s for tab in self.all_tabs() for s in tab.series]
-
-    def all_tabs(self):
-        return [self.tabs.widget(i) for i in range(self.tabs.count())]
-
-    def current_tab(self):
-        return self.tabs.currentWidget()
-
-    def add_tab(self, title=None):
-        tab = GraphTab(self)
-        self._tab_no += 1
-        i = self.tabs.addTab(tab, title or f"Graph {self._tab_no}")
-        self.tabs.setCurrentIndex(i)
-        tab.set_follow(self.follow)
-        if hasattr(self, "btn_cursors") and self.btn_cursors.isChecked():
-            tab.set_cursors(True)
-        return tab
-
-    def close_tab(self, i):
-        if self.tabs.count() <= 1:
-            self.statusBar().showMessage("Keep at least one graph tab.")
-            return
-        tab = self.tabs.widget(i)
-        if tab.series and QtWidgets.QMessageBox.question(
-                self, "Close tab", f"Close '{self.tabs.tabText(i)}' and remove its {len(tab.series)} "
-                                   "variable(s)?") != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
-        tab.remove_all_series()
-        self.tabs.removeTab(i)
-        tab.deleteLater()
-
-    def rename_tab(self, i):
-        if i < 0:
-            return
-        text, ok = QtWidgets.QInputDialog.getText(self, "Rename tab", "Tab name:", text=self.tabs.tabText(i))
-        if ok and text.strip():
-            self.tabs.setTabText(i, text.strip())
-
     # ---- display
-    def refresh(self):
-        self._tick += 1
-        if self._tick % 20 == 0:
-            self._check_elf()
-        cur = self.btn_cursors.isChecked()
-        window = self.spin_window.value()
-        for tab in self.all_tabs():
-            tab.refresh(cur, self.follow, window, self.t_last)
-        self._update_stream_ui()
-
-    def set_follow(self, on):
-        self.follow = on
-        for tab in self.all_tabs():
-            tab.set_follow(on)
-
-    def fit_view(self):
-        """Fit X: show the whole recorded time range of the current tab and stop following."""
-        self.btn_follow.setChecked(False)
-        self.follow = False
-        self.current_tab().fit_x()
-
-    def fit_y(self):
-        self.current_tab().fit_y()
-
-    def set_cursors(self, on):
-        if on:
-            self.btn_follow.setChecked(False)
-        for tab in self.all_tabs():
-            tab.set_cursors(on)
-
     # ---- registers
     def show_registers(self):
         if self.reg_dlg is None:
@@ -2473,12 +2681,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if size not in UNSIGNED:
             QtWidgets.QMessageBox.information(self, "Unsupported", f"{size * 8}-bit registers cannot be plotted.")
             return
-        self.current_tab().add_series(name, addr, size, UNSIGNED[size], enum, bits, fixed=True)
+        self.add_series(name, addr, size, UNSIGNED[size], enum, bits, fixed=True)
         self.statusBar().showMessage(f"Added {name} to the plot")
-
-    def clear_data(self):
-        for tab in self.all_tabs():
-            tab.clear_data()
 
     # ---- streaming
     def show_stream(self):
@@ -2515,11 +2719,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stream_n += 1
         if cfg["every"] > 1 and (self._stream_n - 1) % cfg["every"]:
             return
-        cols, seen = [], set()
-        for s in self.series:                    # a variable plotted in several tabs is sent once
-            if s.id in values and s.name not in seen:
-                seen.add(s.name)
-                cols.append(s)
+        cols = [s for s in self.all_series() if s.id in values]
         if not cols:
             return
         scaled = cfg["scaled"]
@@ -2550,25 +2750,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stream_dlg is not None and self.stream_dlg.isVisible():
             self.stream_dlg.update_status()
 
-    def export_csv(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV", "samples.csv", "CSV (*.csv)")
-        if not path:
-            return
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["variable", "time_s", "raw", "processed", "tab"])
-            for i, tab in enumerate(self.all_tabs()):
-                for s in tab.series:
-                    n = len(s.t)
-                    if not n:
-                        continue
-                    ts = np.fromiter(s.t, float, n)
-                    raw = np.fromiter(s.y, float, n)
-                    proc = tab.process(s, ts, raw)
-                    for t, r, p in zip(ts, raw, proc):
-                        w.writerow([s.name, f"{t:.6f}", r, p, self.tabs.tabText(i)])
-        self.statusBar().showMessage(f"Saved {path}")
-
+    # ---- writing values
+    # ---- vertical fit
+    # ---- post-processing
     def closeEvent(self, ev):
         self.stop_stream()
         if self.poller is not None:
@@ -2615,6 +2799,8 @@ def main():
     w.show()
     if len(sys.argv) > 1:
         w.load_elf(sys.argv[1])
+    else:
+        w.restore_last_elf()
     sys.exit(app.exec())
 
 
