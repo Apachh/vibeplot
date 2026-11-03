@@ -23,6 +23,8 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 - Live graph with a rolling time window, **Follow live**, **Fit** (both axes) and **Fit Y** (vertical only).
 - Two measurement cursors with values at each cursor, Δ between them, Δt and frequency.
 - Post-processing per variable: moving average, moving RMS, median, low-pass (EMA), derivative, integral, absolute value, remove mean, plus gain and offset.
+- **Favorites and groups**: star the variables you use all the time and sort them into named groups; one double-click puts a whole group on the plot. Favorites are saved per ELF file.
+- **Remembers the last ELF** and reopens it the next time the app starts.
 - Offset editor that matches the variable's type (whole numbers for integers, decimals for floats).
 - **Write values** back into the target's memory (double-click the value).
 - Enums are shown by name in the table, at the cursors and on the Y axis.
@@ -64,7 +66,7 @@ A plain `pip install` outside a virtual environment fails on many Linux distribu
 
 1. In VS Code press **F5** so Cortex-Debug starts OpenOCD, and let the target run.
 2. Find OpenOCD's **Tcl port** (see below).
-3. Start the app and open your ELF (**Open ELF…** or pass it on the command line).
+3. Start the app and open your ELF (**Open ELF…** or pass it on the command line). The app remembers it and reopens it by itself next time.
 4. Enter the Tcl port in the top bar and press **Connect**.
 5. Filter the variable list and double-click the variables you want. They appear on the graph.
 6. After rebuilding the firmware the app reloads the ELF by itself (see **Reload ELF**). Remember to flash the new firmware as well, because addresses in the running target only change after you flash it.
@@ -96,10 +98,19 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 | Fit X | Show the whole recorded time range (stops following) |
 | Fit Y | Fit the vertical range to the data in the visible time range (use with Fit X to fit both axes) |
 | Cursors | Show two measurement cursors (stops following so the view stays still) |
-| Clear data | Delete the recorded samples, keep the variables |
+| Clear data | Delete the recorded samples of the current tab, keep the variables |
 | Export CSV… | Save the recorded data of all tabs (`variable, time_s, raw, processed, tab`) |
 | Stream… | Open the live streaming settings |
 | Registers… | Open the MCU register viewer (see below) |
+
+Follow live, Fit X, Fit Y, Cursors and Clear data act on the **current tab** (each tab remembers its own Follow and Cursors state). The connection, Period, Window, ELF and streaming are shared by all tabs.
+
+### Graph tabs and stacked graphs
+
+- Variables from the tree, the favorites and the register viewer are added to the **current tab**. Use **＋** (top right of the tab bar) for another tab, double-click a tab's title to rename it, and ✕ to close it (you are asked first if it still has variables).
+- **Add graph** stacks another graph below inside the tab. All graphs of a tab share the time axis, so zooming or following moves them together, and the two cursors move together as well. Y axes are independent.
+- **New variables go to** chooses the graph that receives the next variables you add. The **Graph** column in the table moves an existing variable to another graph. **Remove graph** (for the graph chosen in that box; Graph 1 stays) moves its variables to Graph 1.
+- Every tab has its own variable table, post-processing panel and cursor readouts.
 
 ### Variable tree (left)
 
@@ -107,12 +118,22 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 - Double-click a variable to plot it. Double-click a struct or an array to add its members (up to 64).
 - **Add by address…** plots any memory address as a raw 32-bit value. Change its type in the table.
 
+### Favorites and groups
+
+- Select variables in the **Variables** tab and press **★ Favorite** (or right-click them) to add them to a group. A ★ appears in front of favorite variables. Structs and arrays can be favorites too; plotting one adds its members.
+- The **★ Favorites** tab lists your groups. **Double-click a variable** to plot it, or **double-click a group** to plot every variable in it. **Add to plot ▶** does the same for the selection.
+- Right-click in the tab to move variables between groups, rename or delete a group, or remove variables. **New group…** creates an empty group.
+- A variable that is not in the loaded ELF any more (renamed or removed) stays in the list in grey, so a rename doesn't silently lose it.
+- Favorites are stored per ELF file. Tick **Share between all ELF files** to use one list for every project (your current list is kept when you switch it on).
+- Favorites and the last ELF are stored in Qt's settings file for the app (on Linux: `~/.config/swdplot/swd_liveplot.conf`).
+
 ### Variable table (bottom right)
 
 | Column | Meaning |
 |---|---|
 | Show | Plot and read this variable (unchecked variables are not read, which saves SWD bandwidth) |
 | Name, Address | The variable and its RAM address |
+| Graph | Which graph of the tab shows the variable (shown next to the name) |
 | Type | Data type used to interpret the memory. You can change it, for example when there is no debug info |
 | Offset | Offset added to the plotted signal. The editor matches the type (integer or decimal) |
 | Value | Latest value. Double-click it to **write** a new value. Enums show their name |
@@ -222,6 +243,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 | File | Purpose |
 |---|---|
 | `swd_liveplot.py` | The application |
+| `favorites.py` | Favorite variables and groups (must stay next to `swd_liveplot.py`) |
 | `svd_regs.py` | SVD parser and built-in Cortex-M core register definitions (must stay next to `swd_liveplot.py`) |
 | `run_swdplot.sh` | Launcher that sets up a virtual environment and starts the app |
 | `README.md` | This file |
