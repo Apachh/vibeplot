@@ -19,6 +19,7 @@ variables in RAM ──SWD──> ST-Link ──> OpenOCD (started by Cortex-Deb
 
 - Load an `.elf` and browse its global and `static` variables, including C++ ones (namespaces, class static members, base classes).
 - Structs, unions, arrays, C++ base classes and bitfields expand in the tree, including **packed structs** (unaligned members are read safely, byte by byte). The tree shows each member's address, byte offset and bit range. Double-click a struct to add all of its members.
+- **Debug session without VS Code**: the app can start OpenOCD itself, connect to it, and offer Halt / Resume / Reset / Flash. Open the firmware ELF, press **Debug session…**, **Start session**, and watch your variables.
 - **Graph tabs**: each tab has its own plot, variable table and cursors. **Add selected** puts variables on the current tab; use **＋** for a new tab, double-click a tab to rename it, ✕ to close it. All tabs share one connection and one sampling loop. Inside a tab, **Add graph** stacks more graphs that share the time axis and cursors; the **Graph** column of the variable table (or **New variables go to**) chooses which graph shows each variable, and **Remove graph** moves its variables to Graph 1.
 - Live graph with a rolling time window, **Follow live**, **Fit** (both axes) and **Fit Y** (vertical only).
 - Two measurement cursors with values at each cursor, Δ between them, Δt and frequency.
@@ -71,7 +72,27 @@ A plain `pip install` outside a virtual environment fails on many Linux distribu
 5. Filter the variable list and double-click the variables you want. They appear on the graph.
 6. After rebuilding the firmware the app reloads the ELF by itself (see **Reload ELF**). Remember to flash the new firmware as well, because addresses in the running target only change after you flash it.
 
-### Finding the Tcl port
+### Without VS Code: Debug session
+
+You do not need VS Code or Cortex-Debug to watch variables. **Debug session…** starts OpenOCD for you:
+
+1. Install OpenOCD once (Debian/Ubuntu/Mint: `sudo apt install openocd`) and plug in the probe.
+2. Open your firmware ELF in the main window.
+3. Press **Debug session…**, choose the **debug probe** (for example `interface/stlink.cfg`) and your **target chip** (for example `target/stm32f4x.cfg`; you can type any OpenOCD config file), then press **Start session**.
+4. The app waits until OpenOCD reports its Tcl port and **connects by itself**. Then add variables as usual. Your settings are remembered.
+
+Also in that window:
+
+- **Halt**, **Resume**, **Reset (run)** and **Reset (halt)** act on the target. Reading variables does not need the target halted.
+- **Flash ELF…** programs the loaded ELF, verifies it and resets the target (after a confirmation). Flashing can take a while; plotting continues afterwards.
+- The OpenOCD log is shown in the window. **Extra arguments** takes anything OpenOCD understands, for example `-c "adapter speed 4000"`; **Scripts folder** sets `-s` if OpenOCD cannot find its configuration files.
+- Tick **Also open the GDB port** to keep GDB port 3333 open. VS Code can then attach to the same session (Cortex-Debug `servertype: "external"`, `gdbTarget: "localhost:3333"`) while the plot keeps running.
+
+Only one program can use the debug probe at a time. If the log shows that the probe is busy or cannot be opened, close the other debug session first (for example the one VS Code started). On Linux the probe also needs USB permissions; the OpenOCD package normally installs the udev rules, and you may need to replug the probe or log in again.
+
+The session is stopped when you press **Stop session** or close the app.
+
+### Finding the Tcl port (when VS Code starts OpenOCD)
 
 Cortex-Debug chooses the OpenOCD ports for each debug session. Look at the OpenOCD command line or its output, for example:
 
@@ -102,6 +123,7 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 | Export CSV… | Save the recorded data of all tabs (`variable, time_s, raw, processed, tab`) |
 | Stream… | Open the live streaming settings |
 | Registers… | Open the MCU register viewer (see below) |
+| Debug session… | Start OpenOCD from the app and connect to it (see below) |
 
 Follow live, Fit X, Fit Y, Cursors and Clear data act on the **current tab** (each tab remembers its own Follow and Cursors state). The connection, Period, Window, ELF and streaming are shared by all tabs.
 
@@ -229,6 +251,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 
 | Problem | Check |
 |---|---|
+| The debug session stops right away | Read the log in the Debug session window: wrong target or probe file, probe busy (another debugger is running), or missing USB permissions |
 | "Cannot connect" | Wrong port (use the Tcl port, default 50001), OpenOCD not running, or the debug session ended |
 | Values wrong right after a rebuild | The ELF was reloaded but the target still runs the old firmware; flash and restart the debug session |
 | Read error with an OpenOCD message | OpenOCD older than 0.10, or the address is not readable memory |
@@ -244,6 +267,7 @@ Quick check on Linux: start streaming to the virtual COM port and run `cat /tmp/
 |---|---|
 | `swd_liveplot.py` | The application |
 | `favorites.py` | Favorite variables and groups (must stay next to `swd_liveplot.py`) |
+| `session.py` | Debug session: starts and supervises OpenOCD (must stay next to `swd_liveplot.py`) |
 | `svd_regs.py` | SVD parser and built-in Cortex-M core register definitions (must stay next to `swd_liveplot.py`) |
 | `run_swdplot.sh` | Launcher that sets up a virtual environment and starts the app |
 | `README.md` | This file |

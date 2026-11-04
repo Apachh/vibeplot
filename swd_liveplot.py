@@ -34,6 +34,7 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
 import favorites
+import session
 import svd_regs
 
 MAXPTS = 50000
@@ -462,6 +463,20 @@ class Poller(QtCore.QThread):
         self.writes.put(("w", name, addr, raw))
         self.wake.set()
 
+    def request_command(self, label, cmd, timeout=10.0):
+        """Queue a free-form OpenOCD command (halt, resume, reset run, program ...)."""
+        self.writes.put(("cmd", label, cmd, timeout))
+        self.wake.set()
+
+    def _run_command(self, label, cmd, timeout):
+        try:
+            self.sock.settimeout(timeout)        # flashing can take much longer than a memory read
+            out = self.tcl(cmd)
+        finally:
+            self.sock.settimeout(3)
+        out = " ".join(out.split())
+        self.status.emit(f"{label}: {out[:200] if out else 'done'}")
+
     def request_rmw(self, name, addr, size, mask, value):
         """Queue a read-modify-write of `mask` bits (done back to back inside the polling thread)."""
         self.writes.put(("rmw", name, addr, size, mask, value))
@@ -520,6 +535,9 @@ class Poller(QtCore.QThread):
                 op = self.writes.get_nowait()
             except queue.Empty:
                 return
+            if op[0] == "cmd":
+                self._run_command(op[1], op[2], op[3])
+                continue
             name, addr = op[1], op[2]
             try:
                 if op[0] == "rmw":
@@ -2074,6 +2092,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fav_set = set()          # paths of favorite variables (for the ★ marks)
         self._roots_by_name = {}       # name -> root nodes of the loaded ELF
         self.reg_dlg = None
+        self.session_dlg = None
         self.stream_dlg = None
         self.sink = None
         self.stream_cfg = None
@@ -2140,6 +2159,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_regs = W.QPushButton("Registers…")
         self.btn_regs.setToolTip("Browse the MCU's peripheral and Cortex-M core registers (SVD file)")
         self.btn_regs.clicked.connect(self.show_registers)
+        self.btn_session = W.QPushButton("Debug session…")
+        self.btn_session.setToolTip("Start OpenOCD from here and connect to it - no VS Code needed")
+        self.btn_session.clicked.connect(self.show_session)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_reload)
         top.addWidget(self.chk_auto_elf)
@@ -2160,6 +2182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.btn_csv)
         top.addWidget(self.btn_stream)
         top.addWidget(self.btn_regs)
+        top.addWidget(self.btn_session)
 
         # left: variable tree
         left = W.QWidget()
@@ -2665,6 +2688,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_conn.setText("Connect")
 
     # ---- display
+    # ---- debug session (OpenOCD started by this app)
+    def show_session(self):
+        if self.session_dlg is None:
+            self.session_dlg = session.SessionDialog(self)
+        self.session_dlg.show()
+        self.session_dlg.raise_()
+        self.session_dlg.activateWindow()
+
+    def connect_to(self, host, port):
+        """Connect to an OpenOCD Tcl port (reconnects if already connected)."""
+        self.edit_host.setText(host)
+        self.spin_port.setValue(port)
+        if self.poller is not None:
+            self.toggle_connect()          # disconnect the old connection
+        self.toggle_connect()
+
     # ---- registers
     def show_registers(self):
         if self.reg_dlg is None:
@@ -2755,6 +2794,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- post-processing
     def closeEvent(self, ev):
         self.stop_stream()
+        if self.session_dlg is not None:
+            self.session_dlg.shutdown()
         if self.poller is not None:
             self.poller.stop()
             self.poller.wait(3000)
