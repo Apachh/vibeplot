@@ -106,12 +106,23 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 
 ## Using the app
 
-### Top bar
+### Menus and toolbar
+
+The window has a menu bar and a slim toolbar with the controls you use all the time.
+
+| Menu | Entries |
+|---|---|
+| **File** | Open ELF… (Ctrl+O), Reload ELF (Ctrl+R), Auto-reload when the ELF changes, Export CSV… (Ctrl+E), Quit (Ctrl+Q) |
+| **Session** | Debug session… (Ctrl+D), Connect / Disconnect (Ctrl+K) |
+| **View** | Follow live, Fit X, Fit Y, Cursors, Clear data, New graph tab (Ctrl+T) |
+| **Data** | Stream… (Ctrl+Shift+S), Export CSV… |
+| **Tools** | Registers… (Ctrl+Shift+R) |
+
+The toolbar at the top holds the OpenOCD **Host**, **Port** and **Connect**, then **Period** and **Window**. **Follow live**, **Fit X**, **Fit Y** and **Cursors** sit in a row directly above the graphs, because they act on the graph tab you are looking at. The loaded ELF is shown at the bottom right of the status bar. The menu check marks for Follow live and Cursors always match the toolbar buttons.
 
 | Control | What it does |
 |---|---|
-| Open ELF… | Load a firmware ELF and list its variables |
-| Reload ELF, Auto | Re-read the ELF after a rebuild and move the plotted variables to their new addresses. With **Auto** ticked (default) this happens by itself when the file changes on disk; otherwise the button turns into `Reload ELF ●` and the file name turns orange |
+| Open ELF…, Reload ELF, Auto-reload | Load a firmware ELF; re-read it after a rebuild and move the plotted variables to their new addresses. With auto-reload ticked (default) this happens by itself when the file changes on disk; otherwise the menu entry becomes `Reload ELF ●` and the file name in the status bar turns orange |
 | Host / port, Connect | Connect to (or disconnect from) OpenOCD's Tcl port |
 | Period | Target time between reads, in ms (the real rate is limited by the probe) |
 | Window | Seconds of history shown while following |
@@ -121,7 +132,7 @@ The ST-Link can only be owned by one OpenOCD at a time, so this tool must connec
 | Cursors | Show two measurement cursors (stops following so the view stays still) |
 | Clear data | Delete the recorded samples of the current tab, keep the variables |
 | Export CSV… | Save the recorded data of all tabs (`variable, time_s, raw, processed, tab`) |
-| Stream… | Open the live streaming settings |
+| Stream… | Open the live streaming settings (the entry shows `Stream ●` while streaming) |
 | Registers… | Open the MCU register viewer (see below) |
 | Debug session… | Start OpenOCD from the app and connect to it (see below) |
 
