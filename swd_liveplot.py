@@ -2109,14 +2109,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self):
         W = QtWidgets
         top = W.QHBoxLayout()
-        self.btn_open = W.QPushButton("Open ELF…")
-        self.btn_open.clicked.connect(self.open_elf)
-        self.btn_reload = W.QPushButton("Reload ELF")
-        self.btn_reload.setToolTip("Re-read the ELF and move the plotted variables to their new addresses")
-        self.btn_reload.clicked.connect(lambda: self.reload_elf())
-        self.chk_auto_elf = W.QCheckBox("Auto")
-        self.chk_auto_elf.setChecked(True)
-        self.chk_auto_elf.setToolTip("Reload automatically when the ELF file changes on disk (after a rebuild)")
+        QAction = getattr(QtGui, "QAction", None) or W.QAction
+
+        def action(text, slot=None, tip="", shortcut=None, checkable=False, checked=False):
+            a = QAction(text, self)
+            if tip:
+                a.setToolTip(tip)
+                a.setStatusTip(tip)
+            if shortcut:
+                a.setShortcut(QtGui.QKeySequence(shortcut))
+            if checkable:
+                a.setCheckable(True)
+                a.setChecked(checked)
+            if slot is not None:
+                a.triggered.connect(lambda _checked=False, f=slot: f())
+            return a
+        self.act_open = action("&Open ELF…", self.open_elf, "Load a firmware ELF and list its variables", "Ctrl+O")
+        self.act_reload = action("&Reload ELF", self.reload_elf,
+                                 "Re-read the ELF and move the plotted variables to their new addresses", "Ctrl+R")
+        self.btn_reload = self.act_reload       # its text shows "Reload ELF ●" when the file changed on disk
+        self.act_auto_elf = action("&Auto-reload when the ELF changes", None,
+                                   "Reload automatically when the ELF file changes on disk (after a rebuild)",
+                                   checkable=True, checked=True)
+        self.chk_auto_elf = self.act_auto_elf
         self.lbl_elf = W.QLabel("no file loaded")
         self.edit_host = W.QLineEdit("localhost")
         self.edit_host.setFixedWidth(100)
@@ -2149,40 +2164,73 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_cursors.setCheckable(True)
         self.btn_cursors.setToolTip("Two measurement cursors (stops following so the view stays still)")
         self.btn_cursors.toggled.connect(self.set_cursors)
-        self.btn_clear = W.QPushButton("Clear data")
-        self.btn_clear.clicked.connect(self.clear_data)
-        self.btn_csv = W.QPushButton("Export CSV…")
-        self.btn_csv.clicked.connect(self.export_csv)
-        self.btn_stream = W.QPushButton("Stream…")
-        self.btn_stream.setToolTip("Send the plotted values live to a virtual COM port, serial port or file")
-        self.btn_stream.clicked.connect(self.show_stream)
-        self.btn_regs = W.QPushButton("Registers…")
-        self.btn_regs.setToolTip("Browse the MCU's peripheral and Cortex-M core registers (SVD file)")
-        self.btn_regs.clicked.connect(self.show_registers)
-        self.btn_session = W.QPushButton("Debug session…")
-        self.btn_session.setToolTip("Start OpenOCD from here and connect to it - no VS Code needed")
-        self.btn_session.clicked.connect(self.show_session)
-        top.addWidget(self.btn_open)
-        top.addWidget(self.btn_reload)
-        top.addWidget(self.chk_auto_elf)
-        top.addWidget(self.lbl_elf, 1)
-        for lbl, w in (("OpenOCD Tcl host", self.edit_host), ("port", self.spin_port)):
-            top.addWidget(W.QLabel(lbl))
-            top.addWidget(w)
+        self.act_fit_x = action("Fit &X", self.fit_view,
+                                "Show the whole recorded time range (stops following). Use Fit Y for the vertical axis.")
+        self.act_fit_y = action("Fit &Y", self.fit_y, "Fit the vertical range to the data visible in the current time range")
+        self.act_clear = action("&Clear data", self.clear_data,
+                                "Delete the recorded samples of the current tab, keep the variables")
+        self.act_csv = action("&Export CSV…", self.export_csv, "Save the recorded data of all tabs", "Ctrl+E")
+        self.act_stream = action("&Stream…", self.show_stream,
+                                 "Send the plotted values live to a virtual COM port, serial port or file", "Ctrl+Shift+S")
+        self.btn_stream = self.act_stream       # its text shows "Stream ●" while streaming
+        self.act_regs = action("&Registers…", self.show_registers,
+                               "Browse the MCU's peripheral and Cortex-M core registers (SVD file)", "Ctrl+Shift+R")
+        self.act_session = action("&Debug session…", self.show_session,
+                                  "Start OpenOCD from here and connect to it - no VS Code needed", "Ctrl+D")
+        self.act_connect = action("&Connect", self.toggle_connect,
+                                  "Connect to / disconnect from OpenOCD's Tcl port", "Ctrl+K")
+        self.act_new_tab = action("&New graph tab", lambda: self.add_tab(), "Open another graph tab", "Ctrl+T")
+        self.act_quit = action("&Quit", self.close, shortcut="Ctrl+Q")
+        # View menu entries that mirror the two toggle buttons of the toolbar
+        self.act_follow = action("&Follow live", None, "Scroll the view with the newest data",
+                                 checkable=True, checked=True)
+        self.act_cursors = action("C&ursors", None,
+                                  "Two measurement cursors (stops following so the view stays still)", checkable=True)
+        for act, btn in ((self.act_follow, self.btn_follow), (self.act_cursors, self.btn_cursors)):
+            act.toggled.connect(lambda on, b=btn: b.setChecked(on) if b.isChecked() != on else None)
+            btn.toggled.connect(lambda on, a=act: self._set_action_checked(a, on))
+        def vline():
+            f = W.QFrame()
+            f.setFrameShape(W.QFrame.Shape.VLine)
+            f.setFrameShadow(W.QFrame.Shadow.Sunken)
+            return f
+        lbl_host = W.QLabel("Host")
+        lbl_host.setToolTip("OpenOCD's Tcl host and port (the tcl_port of the OpenOCD that is running)")
+        top.addWidget(lbl_host)
+        top.addWidget(self.edit_host)
+        top.addWidget(W.QLabel("Port"))
+        top.addWidget(self.spin_port)
         top.addWidget(self.btn_conn)
+        top.addWidget(vline())
         top.addWidget(W.QLabel("Period"))
         top.addWidget(self.spin_period)
         top.addWidget(W.QLabel("Window"))
         top.addWidget(self.spin_window)
-        top.addWidget(self.btn_follow)
-        top.addWidget(self.btn_fit)
-        top.addWidget(self.btn_fit_y)
-        top.addWidget(self.btn_cursors)
-        top.addWidget(self.btn_clear)
-        top.addWidget(self.btn_csv)
-        top.addWidget(self.btn_stream)
-        top.addWidget(self.btn_regs)
-        top.addWidget(self.btn_session)
+        top.addStretch(1)
+        self.statusBar().addPermanentWidget(self.lbl_elf)      # the loaded ELF, always visible at the bottom
+
+        mb = self.menuBar()
+        m = mb.addMenu("&File")
+        for a in (self.act_open, self.act_reload, self.act_auto_elf):
+            m.addAction(a)
+        m.addSeparator()
+        m.addAction(self.act_csv)
+        m.addSeparator()
+        m.addAction(self.act_quit)
+        m = mb.addMenu("&Session")
+        m.addAction(self.act_session)
+        m.addAction(self.act_connect)
+        m = mb.addMenu("&View")
+        for a in (self.act_follow, self.act_fit_x, self.act_fit_y, self.act_cursors):
+            m.addAction(a)
+        m.addSeparator()
+        m.addAction(self.act_clear)
+        m.addAction(self.act_new_tab)
+        m = mb.addMenu("&Data")
+        m.addAction(self.act_stream)
+        m.addAction(self.act_csv)
+        m = mb.addMenu("&Tools")
+        m.addAction(self.act_regs)
 
         # left: variable tree
         left = W.QWidget()
@@ -2241,7 +2289,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         split = W.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.addWidget(self.left_tabs)
-        split.addWidget(self.tabs)
+        graph_pane = W.QWidget()                      # right side: view buttons above the graph tabs
+        gl = W.QVBoxLayout(graph_pane)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(4)
+        view_row = W.QHBoxLayout()
+        for b in (self.btn_follow, self.btn_fit, self.btn_fit_y, self.btn_cursors):
+            view_row.addWidget(b)
+        view_row.addStretch(1)
+        gl.addLayout(view_row)
+        gl.addWidget(self.tabs, 1)
+        split.addWidget(graph_pane)
         split.setSizes([420, 980])
 
         central = W.QWidget()
@@ -2565,6 +2623,7 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.blockSignals(True)       # show this tab's state without triggering the toggle handlers
             btn.setChecked(val)
             btn.blockSignals(False)
+        self._sync_view_actions()
         tab.refresh_view(self.spin_window.value(), self.t_last)
 
     def add_series(self, name, addr, size, fmt, enum=None, bits=None, fixed=False):
@@ -2670,7 +2729,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.poller.stop()
             self.poller.wait(3000)
             self.poller = None
-            self.btn_conn.setText("Connect")
+            self._conn_ui(False)
             self.statusBar().showMessage("Disconnected")
             return
         self.poller = Poller(self.edit_host.text().strip() or "localhost", self.spin_port.value(),
@@ -2680,12 +2739,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poller.status.connect(self.statusBar().showMessage)
         self.poller.finished.connect(self.on_poller_finished)
         self.poller.start()
-        self.btn_conn.setText("Disconnect")
+        self._conn_ui(True)
 
     def on_poller_finished(self):
         if self.poller is not None and not self.poller.isRunning():
             self.poller = None
-            self.btn_conn.setText("Connect")
+            self._conn_ui(False)
 
     # ---- display
     # ---- debug session (OpenOCD started by this app)
@@ -2695,6 +2754,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_dlg.show()
         self.session_dlg.raise_()
         self.session_dlg.activateWindow()
+
+    def _conn_ui(self, connected):
+        """Keep the Connect button and the Session menu entry in step."""
+        text = "Disconnect" if connected else "Connect"
+        self.btn_conn.setText(text)
+        self.act_connect.setText("&" + text)
+
+    def _set_action_checked(self, act, on):
+        act.blockSignals(True)
+        act.setChecked(on)
+        act.blockSignals(False)
+
+    def _sync_view_actions(self):
+        self._set_action_checked(self.act_follow, self.btn_follow.isChecked())
+        self._set_action_checked(self.act_cursors, self.btn_cursors.isChecked())
 
     def connect_to(self, host, port):
         """Connect to an OpenOCD Tcl port (reconnects if already connected)."""
